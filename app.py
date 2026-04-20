@@ -1,19 +1,33 @@
 """
-NBA Defensive Analytics Dashboard
-Standalone Streamlit app — Dragon Index & Fortress Rating
-
-Run with:
-    streamlit run app.py
+GS+ Live Momentum Engine — app.py (brief v5)
+Run with:  streamlit run app.py
 """
 
-import streamlit as st
-import pandas as pd
+from __future__ import annotations
 
+import hashlib
+import os
+import time
+from typing import Optional
+
+import pandas as pd
+import streamlit as st
+
+# ── Page config (must be first Streamlit call) ────────────────────────────────
+st.set_page_config(
+    page_title="GS+ Live",
+    page_icon="🏀",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ── Internal imports ──────────────────────────────────────────────────────────
 from nba.pipeline import (
     get_all_player_metrics,
     get_team_aggregates,
     get_player_rolling_trend,
     get_play_sequence_stats,
+    nba_headshot_url,
     SEASON,
 )
 from nba.charts import (
@@ -25,426 +39,1141 @@ from nba.charts import (
     plot_steal_chain_sankey,
     plot_sequence_comparison,
 )
-
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="NBA Defensive Analytics",
-    page_icon="🏀",
-    layout="wide",
-    initial_sidebar_state="expanded",
+from nba.live_engine import (
+    GameState,
+    BoxStats,
+    GSPlusSnapshot,
+    TIER_COLORS,
+    POSITION_SLOTS,
+    compute_snapshot,
+    compute_gs_plus_norm_from_pipeline,
+    fetch_live_box_stats,
+    get_live_games,
+    get_player_season_norm,
+    assign_lineup_slots,
 )
+from nba.court_svg import (
+    court_svg_desktop,
+    court_svg_mobile,
+    DESKTOP_SLOTS,
+    MOBILE_SLOTS,
+)
+import nba.analytics as analytics
 
+# ── Admin password hash ───────────────────────────────────────────────────────
+_ADMIN_PW_HASH = hashlib.sha256(
+    os.environ.get("ADMIN_PASSWORD", "gsplus2025").encode()
+).hexdigest()
+
+# ── Global CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-  .metric-pill {
-    display: inline-block;
-    background: #1a2a4a;
-    border-radius: 8px;
-    padding: 4px 14px;
-    font-size: 0.82rem;
-    font-weight: 700;
-    color: #e0e0e0;
-    margin: 2px 4px;
-  }
-  .dragon-pill  { background: #8B1A1A; }
-  .fortress-pill { background: #1A3A5C; }
-  .sec-hdr {
-    font-size: 0.9rem; font-weight: 700; color: #EB6E1F;
-    border-bottom: 1px solid #EB6E1F44;
-    margin-bottom: 0.4rem; padding-bottom: 2px;
-  }
+/* ── Base ──────────────────────────────────────────────────────────────── */
+body, [data-testid="stAppViewContainer"] {
+  background: #0a0a0f !important;
+  color: #e0e0e0;
+  font-family: 'Inter', 'Segoe UI', sans-serif;
+}
+[data-testid="stSidebar"] { background: #0e0e18 !important; }
+
+/* ── Court wrapper ──────────────────────────────────────────────────────── */
+.court-wrap {
+  position: relative;
+  width: 100%;
+  max-width: 1100px;
+  margin: 0 auto;
+  user-select: none;
+}
+.court-svg-layer {
+  width: 100%;
+  display: block;
+}
+
+/* ── Player cards ────────────────────────────────────────────────────────── */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 8px;
+  margin: 10px 0 4px;
+}
+.card-grid-away {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 8px;
+  margin: 4px 0 10px;
+}
+.gs-card {
+  position: relative;
+  background: rgba(14,14,24,0.88);
+  border: 1px solid #2a2a3a;
+  border-radius: 8px;
+  padding: 8px 10px 7px;
+  cursor: pointer;
+  transition: transform 0.12s ease, border-color 0.12s ease;
+  text-decoration: none;
+  display: block;
+  min-width: 90px;
+}
+.gs-card:hover { transform: translateY(-2px); border-color: #EB6E1F88; }
+
+.gs-card.takeover {
+  border: 2px solid #FF4500;
+  box-shadow: 0 0 12px #FF450055;
+}
+.gs-card.bench { opacity: 0.55; }
+
+.card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 2px;
+}
+.card-name  { font-size: 10px; font-weight: 500; color: #ffffff; }
+.card-raw   { font-size: 8px;  color: #666; }
+.card-pct   { font-size: 20px; font-weight: 500; text-align: center; margin: 2px 0; line-height: 1.1; }
+.card-label { font-size: 7px;  color: #555; text-align: center; margin-top: 1px; }
+
+.takeover-pill {
+  position: absolute;
+  top: -12px; left: 50%; transform: translateX(-50%);
+  background: #FF4500;
+  color: #fff;
+  font-size: 7px; font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+.foul-icon  { position: absolute; top: 3px; left: 3px; font-size: 9px; }
+.bench-icon { position: absolute; top: 3px; right: 3px; font-size: 9px; }
+
+/* ── Game selector bar ───────────────────────────────────────────────────── */
+.game-bar {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.game-chip {
+  background: #1a1a2e;
+  border: 1px solid #2a2a4a;
+  border-radius: 20px;
+  padding: 4px 14px;
+  font-size: 12px;
+  color: #aaa;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.game-chip.active {
+  background: #EB6E1F22;
+  border-color: #EB6E1F;
+  color: #EB6E1F;
+  font-weight: 700;
+}
+
+/* ── Team label strip ────────────────────────────────────────────────────── */
+.team-strip {
+  display: flex; justify-content: space-between;
+  align-items: center;
+  font-size: 13px; font-weight: 600;
+  color: #ccc;
+  margin-bottom: 4px;
+  padding: 0 2px;
+}
+.team-strip .score { font-size: 20px; font-weight: 700; color: #fff; }
+.team-strip .clock { font-size: 11px; color: #777; }
+
+/* ── Bio page ────────────────────────────────────────────────────────────── */
+.bio-back { font-size: 13px; color: #EB6E1F; cursor: pointer; margin-bottom: 16px; display: inline-block; }
+.bio-back:hover { text-decoration: underline; }
+
+.bio-header {
+  display: flex; align-items: flex-start; gap: 18px;
+  margin-bottom: 18px;
+}
+.bio-headshot {
+  border-radius: 8px;
+  width: 100px; height: 120px;
+  object-fit: cover;
+  background: #1a1a2e;
+}
+.bio-name   { font-size: 22px; font-weight: 700; color: #fff; margin-bottom: 3px; }
+.bio-meta   { font-size: 13px; color: #888; margin-bottom: 2px; }
+.bio-detail { font-size: 11px; color: #666; }
+
+.bio-ctx-cards { display: flex; gap: 12px; margin-bottom: 18px; }
+.bio-ctx-card {
+  background: #12121e;
+  border: 1px solid #2a2a3a;
+  border-radius: 8px;
+  padding: 10px 16px;
+  min-width: 120px;
+}
+.bio-ctx-card.live { border-color: #EB6E1F; }
+.bio-ctx-label { font-size: 9px; color: #666; text-transform: uppercase; letter-spacing: 1px; }
+.bio-ctx-value { font-size: 22px; font-weight: 600; margin: 2px 0; }
+.bio-ctx-sub   { font-size: 10px; color: #888; }
+
+.stat-strip {
+  display: flex; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+.stat-box {
+  background: #12121e;
+  border: 1px solid #1e1e30;
+  border-radius: 6px;
+  padding: 8px 12px;
+  text-align: center;
+  min-width: 62px;
+}
+.stat-val { font-size: 18px; font-weight: 600; color: #fff; }
+.stat-lbl { font-size: 8px; color: #666; text-transform: uppercase; margin-top: 1px; }
+
+.df-index-row { display: flex; gap: 12px; margin-bottom: 18px; }
+.df-card {
+  flex: 1;
+  background: #12121e;
+  border: 1px solid #1e1e30;
+  border-radius: 8px;
+  padding: 12px 16px;
+}
+.df-card-label { font-size: 9px; color: #666; text-transform: uppercase; letter-spacing: 1px; }
+.df-card-value { font-size: 28px; font-weight: 700; color: #EB6E1F; }
+.df-card-rank  { font-size: 11px; color: #888; }
+.df-card-qual  { font-size: 10px; color: #aaa; margin-top: 4px; font-style: italic; }
+
+/* ── Metric pill (reused from season) ───────────────────────────────────── */
+.metric-pill {
+  display: inline-block; background: #1a2a4a;
+  border-radius: 8px; padding: 4px 14px;
+  font-size: 0.82rem; font-weight: 700; color: #e0e0e0;
+  margin: 2px 4px;
+}
+.dragon-pill   { background: #8B1A1A; }
+.fortress-pill { background: #1A3A5C; }
+.sec-hdr {
+  font-size: 0.9rem; font-weight: 700; color: #EB6E1F;
+  border-bottom: 1px solid #EB6E1F44;
+  margin-bottom: 0.4rem; padding-bottom: 2px;
+}
+
+/* ── TAKEOVER pulse animation ─────────────────────────────────────────────── */
+@keyframes takeover-pulse {
+  0%, 100% { box-shadow: 0 0 8px #FF450055; }
+  50%       { box-shadow: 0 0 22px #FF4500cc; }
+}
+.gs-card.takeover { animation: takeover-pulse 1.4s ease-in-out infinite; }
+
+/* ── FROZEN shimmer ─────────────────────────────────────────────────────── */
+@keyframes frozen-shimmer {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.7; }
+}
+.gs-card.frozen { animation: frozen-shimmer 2s ease-in-out infinite; }
+
+/* ── Admin ───────────────────────────────────────────────────────────────── */
+.admin-metric {
+  background: #12121e; border: 1px solid #2a2a3a;
+  border-radius: 8px; padding: 12px 20px; text-align: center;
+}
+.admin-metric .val { font-size: 28px; font-weight: 700; color: #EB6E1F; }
+.admin-metric .lbl { font-size: 10px; color: #666; text-transform: uppercase; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## 🏀 NBA Defense")
-    st.markdown(f"**Season:** {SEASON}")
-    st.markdown("---")
+# ── Session / analytics bootstrap ────────────────────────────────────────────
+if "session_id" not in st.session_state:
+    st.session_state["session_id"] = analytics.make_session_id()
+if "visitor_id" not in st.session_state:
+    st.session_state["visitor_id"] = analytics.fingerprint_visitor()
 
-    st.markdown("""
-    **Dragon Index** 🐉
-    Active perimeter disruption — steals, deflections, charges drawn,
-    perimeter contests, loose balls.
-
-    **Fortress Rating** 🏰
-    Interior anchoring — rim FG% allowed, box-out rate, blocks,
-    rim contest rate, putbacks.
-    """)
-
-    st.markdown("---")
-    if st.button("🔄 Refresh Data"):
-        get_all_player_metrics.clear()
-        st.rerun()
-    st.caption("Data cached 24 h · Source: nba_api")
-
-# ── Header ────────────────────────────────────────────────────────────────────
-st.markdown("# 🏀 NBA Defensive Analytics")
-st.markdown(
-    '<span class="metric-pill dragon-pill">🐉 Dragon Index — Active Disruption</span>'
-    '<span class="metric-pill fortress-pill">🏰 Fortress Rating — Interior Anchor</span>',
-    unsafe_allow_html=True,
+analytics.track_page_view(
+    st.session_state["session_id"],
+    st.session_state["visitor_id"],
+    path=st.session_state.get("active_player_id") and "/bio" or "/",
 )
-st.markdown("")
 
-# ── Data loading ──────────────────────────────────────────────────────────────
-with st.spinner("Loading NBA defensive metrics (cached 24 h)…"):
+# ── Session state defaults ────────────────────────────────────────────────────
+for key, default in [
+    ("active_player_id", None),
+    ("selected_game_id", None),
+    ("compare_ids", []),
+    ("admin_auth", False),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Helper: season data (cached)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=86_400, show_spinner=False)
+def _season_df() -> pd.DataFrame:
     try:
-        nba_df      = get_all_player_metrics()
-        nba_load_ok = nba_df is not None and not nba_df.empty
-    except Exception as e:
-        st.error(f"Failed to load NBA data: {e}")
-        nba_load_ok = False
-
-if not nba_load_ok:
-    st.info(
-        "NBA data unavailable. nba_api sometimes rate-limits — "
-        "wait a moment and hit **🔄 Refresh Data** in the sidebar."
-    )
-    st.stop()
-
-# ── Position filter (shared across tabs) ──────────────────────────────────────
-pos_opts   = ["All", "Guards", "Wings", "Bigs"]
-pos_map    = {"All": None, "Guards": "Guard", "Wings": "Wing", "Bigs": "Big"}
-sel_pos    = st.radio("Position Filter", pos_opts, horizontal=True, key="pos_filter")
-pos_filter = pos_map[sel_pos]
-
-# ── Aggregate metrics banner ──────────────────────────────────────────────────
-if "COMBINED_SCORE" in nba_df.columns:
-    filt_df  = nba_df if pos_filter is None else nba_df[nba_df.get("POSITION", "") == pos_filter]
-    if not filt_df.empty and "DRAGON_INDEX" in filt_df.columns:
-        top_dragon  = filt_df.nlargest(1, "DRAGON_INDEX").iloc[0]
-        top_fortress= filt_df.nlargest(1, "FORTRESS_RATING").iloc[0]
-        top_combined= filt_df.nlargest(1, "COMBINED_SCORE").iloc[0]
-        b1, b2, b3, b4 = st.columns(4)
-        b1.metric("Players loaded", len(filt_df))
-        b2.metric("🐉 Dragon #1",
-                  f"{top_dragon.get('PLAYER_NAME','').split()[-1]}",
-                  f"{top_dragon['DRAGON_INDEX']:.1f}")
-        b3.metric("🏰 Fortress #1",
-                  f"{top_fortress.get('PLAYER_NAME','').split()[-1]}",
-                  f"{top_fortress['FORTRESS_RATING']:.1f}")
-        b4.metric("⭐ Best Combined",
-                  f"{top_combined.get('PLAYER_NAME','').split()[-1]}",
-                  f"{top_combined['COMBINED_SCORE']:.1f}")
-
-st.markdown("---")
-
-# ── Session state for click-to-compare ───────────────────────────────────────
-if "compare_ids" not in st.session_state:
-    st.session_state["compare_ids"] = []
-
-# ── Main tabs ─────────────────────────────────────────────────────────────────
-(tab_bubble, tab_dragon, tab_fortress,
- tab_compare, tab_teams) = st.tabs([
-    "🫧 Bubble Scatter", "🐉 Dragon LB", "🏰 Fortress LB",
-    "⚔️ Compare", "🏟️ Team View",
-])
+        df = get_all_player_metrics()
+        if df is not None and not df.empty:
+            return compute_gs_plus_norm_from_pipeline(df)
+    except Exception:
+        pass
+    return pd.DataFrame()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🫧 BUBBLE SCATTER
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_bubble:
-    st.markdown("#### Dragon Index vs Fortress Rating")
-    st.caption(
-        "Bubble size ∝ minutes played · "
-        "**Click any bubble** to add that player to the ⚔️ Compare queue"
-    )
-
-    highlight_ids = st.session_state.get("compare_ids", [])
-    bubble_fig    = plot_bubble_scatter(
-        nba_df, position_filter=pos_filter, highlight_ids=highlight_ids
-    )
-    event = st.plotly_chart(
-        bubble_fig, use_container_width=True,
-        on_select="rerun", key="bubble_chart",
-    )
-
-    # Click-to-compare handler
+@st.cache_data(ttl=86_400, show_spinner=False)
+def _player_bio(player_id: int) -> dict:
+    """Fetch player info from nba_api commonplayerinfo."""
+    info: dict = {}
     try:
-        if event and event.get("selection", {}).get("points"):
-            for pt in event["selection"]["points"]:
-                cd  = pt.get("customdata") or []
-                pid = int(cd[6]) if len(cd) > 6 else None
-                if pid and pid not in st.session_state["compare_ids"]:
-                    if len(st.session_state["compare_ids"]) >= 3:
-                        st.session_state["compare_ids"].pop(0)
-                    st.session_state["compare_ids"].append(pid)
+        from nba_api.stats.endpoints import CommonPlayerInfo
+        time.sleep(0.5)
+        cpi = CommonPlayerInfo(player_id=player_id)
+        row = cpi.common_player_info.get_data_frame().iloc[0]
+        info = {
+            "jersey":   str(row.get("JERSEY", "")),
+            "position": str(row.get("POSITION", "")),
+            "team":     str(row.get("TEAM_ABBREVIATION", "")),
+            "height":   str(row.get("HEIGHT", "")),
+            "weight":   str(row.get("WEIGHT", "")),
+            "age":      str(row.get("AGE", "")),
+            "exp":      str(row.get("SEASON_EXP", "")),
+            "name":     str(row.get("DISPLAY_FIRST_LAST", "")),
+        }
+    except Exception:
+        pass
+    return info
+
+
+@st.cache_data(ttl=86_400, show_spinner=False)
+def _season_averages(player_id: int) -> dict:
+    """Per-game season averages for bio page."""
+    avgs: dict = {}
+    try:
+        from nba_api.stats.endpoints import PlayerCareerStats
+        time.sleep(0.5)
+        pcs = PlayerCareerStats(player_id=player_id, per_mode36="PerGame")
+        df = pcs.season_totals_regular_season.get_data_frame()
+        if df.empty:
+            return avgs
+        row = df[df["SEASON_ID"] == SEASON]
+        if row.empty:
+            row = df.iloc[-1:]
+        row = row.iloc[0]
+        avgs = {
+            "PPG":  round(float(row.get("PTS", 0)), 1),
+            "APG":  round(float(row.get("AST", 0)), 1),
+            "RPG":  round(float(row.get("REB", 0)), 1),
+            "SPG":  round(float(row.get("STL", 0)), 1),
+            "BPG":  round(float(row.get("BLK", 0)), 1),
+            "FG%":  round(float(row.get("FG_PCT", 0)) * 100, 1),
+            "3P%":  round(float(row.get("FG3_PCT", 0)) * 100, 1),
+            "FT%":  round(float(row.get("FT_PCT", 0)) * 100, 1),
+            "MPG":  round(float(row.get("MIN", 0)), 1),
+        }
+    except Exception:
+        pass
+    return avgs
+
+
+@st.cache_data(ttl=3_600, show_spinner=False)
+def _last5_games(player_id: int, season_df: pd.DataFrame) -> list[dict]:
+    """Last 5 game logs with GS+ and % vs norm."""
+    games: list[dict] = []
+    try:
+        from nba_api.stats.endpoints import PlayerGameLog
+        time.sleep(0.5)
+        pgl = PlayerGameLog(player_id=player_id, season=SEASON, season_type_all_star="Regular Season")
+        df = pgl.player_game_log.get_data_frame().head(5)
+        norm = get_player_season_norm(player_id, season_df)
+        for _, r in df.iterrows():
+            bs = BoxStats(
+                player_id=player_id,
+                player_name="",
+                team_id=0,
+                position="",
+                min=float(str(r.get("MIN", "0")).split(":")[0]) if r.get("MIN") else 0,
+                pts=int(r.get("PTS", 0)),
+                fgm=int(r.get("FGM", 0)),
+                fga=int(r.get("FGA", 0)),
+                ftm=int(r.get("FTM", 0)),
+                fta=int(r.get("FTA", 0)),
+                oreb=int(r.get("OREB", 0)),
+                dreb=int(r.get("DREB", 0)),
+                ast=int(r.get("AST", 0)),
+                stl=int(r.get("STL", 0)),
+                blk=int(r.get("BLK", 0)),
+                tov=int(r.get("TOV", 0)),
+                pf=int(r.get("PF", 0)),
+                possessions_elapsed=100,  # full game
+            )
+            from nba.live_engine import compute_gs_plus, _classify_tier
+            raw = compute_gs_plus(bs)
+            pct = (raw - norm) / max(abs(norm), 1) * 100
+            tier, color = _classify_tier(pct)
+            games.append({
+                "date":   str(r.get("GAME_DATE", "")),
+                "opp":    str(r.get("MATCHUP", "")).split()[-1],
+                "result": str(r.get("WL", "")),
+                "min":    str(r.get("MIN", "")),
+                "pts":    int(r.get("PTS", 0)),
+                "ast":    int(r.get("AST", 0)),
+                "reb":    int(r.get("REB", 0)),
+                "gs_raw": round(raw, 1),
+                "gs_pct": round(pct, 1),
+                "color":  color,
+            })
+    except Exception:
+        pass
+    return games
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIVE DATA helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _live_games() -> list[dict]:
+    return get_live_games()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _live_snapshots(game_id: str, season_df_hash: str) -> list[GSPlusSnapshot]:
+    """Compute GS+ snapshots for all players in a game. Cache 30 s."""
+    sdf = _season_df()
+    boxes = fetch_live_box_stats(game_id)
+    if not boxes:
+        return []
+
+    # Build a minimal GameState per game (not persisted across cache hits)
+    state = GameState(game_id=game_id, home_team=0, away_team=0)
+
+    snaps: list[GSPlusSnapshot] = []
+    for b in boxes:
+        norm = get_player_season_norm(b.player_id, sdf)
+        snap = compute_snapshot(b, norm, state)
+        snaps.append(snap)
+    return snaps
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CARD HTML builder
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _card_html(snap: GSPlusSnapshot) -> str:
+    sign     = "+" if snap.pct_vs_norm >= 0 else ""
+    pct_str  = f"{sign}{snap.pct_vs_norm:.0f}%"
+    raw_str  = f"{snap.raw_gs_plus:+.1f}"
+
+    css_cls  = "gs-card"
+    if snap.takeover_active:
+        css_cls += " takeover"
+    elif snap.tier == "FROZEN":
+        css_cls += " frozen"
+    if snap.bench_state:
+        css_cls += " bench"
+
+    takeover_pill = (
+        '<span class="takeover-pill">🔥 TAKEOVER</span>'
+        if snap.takeover_active else ""
+    )
+    foul_icon  = '<span class="foul-icon">⚠️</span>' if snap.foul_trouble else ""
+    bench_icon = '<span class="bench-icon">🪑</span>' if snap.bench_state else ""
+
+    arrow = snap.velocity_arrow
+
+    # Clicking the card sets active_player in session state via a query param hack
+    # (Streamlit doesn't support onclick easily; we use st.button workarounds upstream)
+    return f"""
+<div class="{css_cls}" data-player-id="{snap.player_id}"
+     onclick="window.location.href='?player={snap.player_id}'"
+     title="Click for {snap.player_name} bio">
+  {takeover_pill}{foul_icon}{bench_icon}
+  <div class="card-top">
+    <span class="card-name">{snap.player_name.split()[-1]}</span>
+    <span class="card-raw">{raw_str}</span>
+  </div>
+  <div class="card-pct" style="color:{snap.tier_color}">
+    {pct_str} {arrow}
+  </div>
+  <div class="card-label">vs. norm</div>
+</div>
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAYER BIO PAGE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_bio_page(player_id: int, season_df: pd.DataFrame) -> None:
+    # ── Back link ──────────────────────────────────────────────────────────
+    if st.button("← Back to court", key="bio_back"):
+        st.session_state["active_player_id"] = None
+        st.rerun()
+
+    # ── Pull data ─────────────────────────────────────────────────────────
+    with st.spinner("Loading player data…"):
+        bio   = _player_bio(player_id)
+        avgs  = _season_averages(player_id)
+        last5 = _last5_games(player_id, season_df)
+
+    player_name = bio.get("name", f"Player {player_id}")
+    headshot    = nba_headshot_url(player_id).replace("1040x760", "260x190")
+
+    # ── Identity header ───────────────────────────────────────────────────
+    col_img, col_info, col_ctx = st.columns([1, 2, 3])
+
+    with col_img:
+        st.markdown(
+            f'<img src="{headshot}" class="bio-headshot" '
+            f'onerror="this.style.display=\'none\'" />',
+            unsafe_allow_html=True,
+        )
+
+    with col_info:
+        st.markdown(f'<div class="bio-name">{player_name}</div>', unsafe_allow_html=True)
+        jersey   = bio.get("jersey", "")
+        position = bio.get("position", "")
+        team     = bio.get("team", "")
+        st.markdown(
+            f'<div class="bio-meta">#{jersey} · {position} · {team}</div>',
+            unsafe_allow_html=True,
+        )
+        height = bio.get("height", "")
+        weight = bio.get("weight", "")
+        age    = bio.get("age", "")
+        exp    = bio.get("exp", "")
+        st.markdown(
+            f'<div class="bio-detail">{height} · {weight} lbs · Age {age} · {exp} yr exp</div>',
+            unsafe_allow_html=True,
+        )
+
+    with col_ctx:
+        # Dragon / Fortress from season_df
+        dragon_val = fortress_val = dragon_rank = fortress_rank = None
+        if not season_df.empty and "PLAYER_ID" in season_df.columns:
+            prow = season_df[season_df["PLAYER_ID"] == player_id]
+            if not prow.empty:
+                dragon_val   = prow.iloc[0].get("DRAGON_INDEX")
+                fortress_val = prow.iloc[0].get("FORTRESS_RATING")
+                if dragon_val is not None and "DRAGON_INDEX" in season_df.columns:
+                    dragon_rank = int(
+                        (season_df["DRAGON_INDEX"] > dragon_val).sum() + 1
+                    )
+                if fortress_val is not None and "FORTRESS_RATING" in season_df.columns:
+                    fortress_rank = int(
+                        (season_df["FORTRESS_RATING"] > fortress_val).sum() + 1
+                    )
+
+        norm = get_player_season_norm(player_id, season_df)
+
+        ctx_html = '<div class="bio-ctx-cards">'
+        ctx_html += f"""
+        <div class="bio-ctx-card">
+          <div class="bio-ctx-label">Season GS+ Norm</div>
+          <div class="bio-ctx-value" style="color:#EB6E1F">{norm:+.1f}</div>
+          <div class="bio-ctx-sub">per-game baseline</div>
+        </div>
+        """
+        if dragon_val is not None:
+            ctx_html += f"""
+            <div class="bio-ctx-card">
+              <div class="bio-ctx-label">Dragon Index</div>
+              <div class="bio-ctx-value" style="color:#e74c3c">{dragon_val:.1f}</div>
+              <div class="bio-ctx-sub">#{dragon_rank} in league</div>
+            </div>
+            """
+        if fortress_val is not None:
+            ctx_html += f"""
+            <div class="bio-ctx-card">
+              <div class="bio-ctx-label">Fortress Rating</div>
+              <div class="bio-ctx-value" style="color:#4A90D9">{fortress_val:.1f}</div>
+              <div class="bio-ctx-sub">#{fortress_rank} in league</div>
+            </div>
+            """
+        ctx_html += "</div>"
+        st.markdown(ctx_html, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Season averages strip ─────────────────────────────────────────────
+    if avgs:
+        stat_keys = ["PPG", "APG", "RPG", "SPG", "FG%", "3P%", "FT%", "MPG"]
+        strip_html = '<div class="stat-strip">'
+        for k in stat_keys:
+            val = avgs.get(k, "—")
+            suffix = "%" if "%" in k else ""
+            strip_html += f"""
+            <div class="stat-box">
+              <div class="stat-val">{val}{suffix}</div>
+              <div class="stat-lbl">{k}</div>
+            </div>
+            """
+        strip_html += "</div>"
+        st.markdown(strip_html, unsafe_allow_html=True)
+    else:
+        st.caption("Season averages unavailable.")
+
+    # ── Dragon + Fortress qualitative cards ──────────────────────────────
+    if dragon_val is not None or fortress_val is not None:
+        def _dragon_label(v):
+            if v is None: return "—"
+            if v >= 75: return "elite perimeter disruptor"
+            if v >= 55: return "active perimeter disruptor"
+            if v >= 35: return "moderate perimeter disruptor"
+            return "limited perimeter presence"
+
+        def _fortress_label(v):
+            if v is None: return "—"
+            if v >= 75: return "elite rim protector"
+            if v >= 55: return "reliable paint anchor"
+            if v >= 35: return "moderate interior presence"
+            return "not a paint anchor"
+
+        df_html = '<div class="df-index-row">'
+        if dragon_val is not None:
+            df_html += f"""
+            <div class="df-card">
+              <div class="df-card-label">🐉 Dragon Index</div>
+              <div class="df-card-value">{dragon_val:.1f}</div>
+              <div class="df-card-rank">#{dragon_rank} league-wide</div>
+              <div class="df-card-qual">{_dragon_label(dragon_val)}</div>
+            </div>
+            """
+        if fortress_val is not None:
+            df_html += f"""
+            <div class="df-card">
+              <div class="df-card-label">🏰 Fortress Rating</div>
+              <div class="df-card-value" style="color:#4A90D9">{fortress_val:.1f}</div>
+              <div class="df-card-rank">#{fortress_rank} league-wide</div>
+              <div class="df-card-qual">{_fortress_label(fortress_val)}</div>
+            </div>
+            """
+        df_html += "</div>"
+        st.markdown(df_html, unsafe_allow_html=True)
+
+    # ── Last 5 games table ────────────────────────────────────────────────
+    st.markdown("#### Last 5 Games")
+    if last5:
+        rows_html = ""
+        for g in last5:
+            sign = "+" if g["gs_pct"] >= 0 else ""
+            rows_html += f"""
+            <tr>
+              <td>{g['date']}</td>
+              <td>{g['opp']}</td>
+              <td>{g['result']}</td>
+              <td>{g['min']}</td>
+              <td>{g['pts']}/{g['ast']}/{g['reb']}</td>
+              <td>{g['gs_raw']:+.1f}</td>
+              <td style="color:{g['color']};font-weight:600">{sign}{g['gs_pct']:.0f}%</td>
+            </tr>
+            """
+        table_html = f"""
+        <table style="width:100%;border-collapse:collapse;font-size:12px;color:#ccc">
+          <thead>
+            <tr style="color:#666;font-size:10px;text-transform:uppercase;border-bottom:1px solid #2a2a3a">
+              <th align="left">Date</th><th align="left">Opp</th>
+              <th align="left">W/L</th><th align="left">Min</th>
+              <th align="left">P/A/R</th><th align="left">GS+</th>
+              <th align="left">vs Norm</th>
+            </tr>
+          </thead>
+          <tbody>{rows_html}</tbody>
+        </table>
+        """
+        st.markdown(table_html, unsafe_allow_html=True)
+    else:
+        st.caption("Game log unavailable.")
+
+    # ── Tonight's GS+ timeline (if live game available) ───────────────────
+    live_games = _live_games()
+    player_snap = None
+    for g in live_games:
+        snaps = _live_snapshots(g["game_id"], "")
+        for s in snaps:
+            if s.player_id == player_id:
+                player_snap = s
+                break
+
+    if player_snap:
+        st.markdown("#### Tonight's GS+ Timeline")
+        # Build timeline from history (requires GameState — simplified sparkline)
+        sign = "+" if player_snap.pct_vs_norm >= 0 else ""
+        st.markdown(
+            f'<div class="bio-ctx-card live" style="display:inline-block;margin-bottom:12px">'
+            f'<div class="bio-ctx-label">LIVE GS+</div>'
+            f'<div class="bio-ctx-value" style="color:{player_snap.tier_color}">'
+            f'{sign}{player_snap.pct_vs_norm:.0f}%</div>'
+            f'<div class="bio-ctx-sub">{player_snap.raw_gs_plus:+.1f} raw · {player_snap.tier}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("Full timeline requires live play-by-play — coming in a future update.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HOMEPAGE — court + cards
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_homepage(season_df: pd.DataFrame) -> None:
+    # ── Handle ?player= query param (card click → bio routing) ─────────────
+    try:
+        params = st.query_params
+        qp = params.get("player")
+        if qp:
+            pid = int(qp)
+            st.session_state["active_player_id"] = pid
+            st.query_params.clear()
             st.rerun()
     except Exception:
         pass
 
-    # Compare queue status
-    if st.session_state["compare_ids"]:
-        cids  = st.session_state["compare_ids"]
-        names = (
-            nba_df[nba_df["PLAYER_ID"].isin(cids)]["PLAYER_NAME"].tolist()
-            if "PLAYER_NAME" in nba_df.columns else [str(i) for i in cids]
+    # ── Live game selector ────────────────────────────────────────────────
+    live_games = _live_games()
+    no_games = not live_games
+
+    st.markdown("### 🏀 GS+ Live Momentum")
+
+    if no_games:
+        st.info(
+            "No live games right now. "
+            "The court will populate automatically when a game starts. "
+            "Check out 📊 Season analytics below."
         )
-        st.caption(f"**Compare queue:** {', '.join(names)}  →  go to ⚔️ Compare tab")
-        if st.button("Clear selection"):
-            st.session_state["compare_ids"] = []
+        _render_season_tabs(season_df)
+        return
+
+    # Game selector chips (rendered as radio for Streamlit compatibility)
+    game_labels = {
+        g["game_id"]: f"{g['away_abbr']} @ {g['home_abbr']}  {g['away_score']}–{g['home_score']}  {g['status']}"
+        for g in live_games
+    }
+    game_ids = list(game_labels.keys())
+
+    if st.session_state["selected_game_id"] not in game_ids:
+        st.session_state["selected_game_id"] = game_ids[0]
+
+    sel = st.radio(
+        "Game",
+        game_ids,
+        format_func=lambda gid: game_labels[gid],
+        horizontal=True,
+        key="game_radio",
+        label_visibility="collapsed",
+    )
+    st.session_state["selected_game_id"] = sel
+    game = next(g for g in live_games if g["game_id"] == sel)
+
+    # ── Team strip ────────────────────────────────────────────────────────
+    st.markdown(
+        f'<div class="team-strip">'
+        f'<span>{game["away_abbr"]}</span>'
+        f'<span class="score">{game["away_score"]} – {game["home_score"]}</span>'
+        f'<span class="clock">Q{game["period"]}  {game["clock"]}</span>'
+        f'<span>{game["home_abbr"]}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Fetch snapshots ───────────────────────────────────────────────────
+    with st.spinner("Loading live GS+…"):
+        snaps = _live_snapshots(game["game_id"], "")
+
+    home_snaps = [s for s in snaps if s.team_id == game["home_team_id"]]
+    away_snaps = [s for s in snaps if s.team_id == game["away_team_id"]]
+
+    # Sort by canonical position order
+    pos_order = {p: i for i, p in enumerate(POSITION_SLOTS)}
+    home_snaps.sort(key=lambda s: pos_order.get(s.position, 9))
+    away_snaps.sort(key=lambda s: pos_order.get(s.position, 9))
+
+    # Take top 5 (starters / highest-minute players)
+    home_top5 = home_snaps[:5]
+    away_top5 = away_snaps[:5]
+
+    # ── Court SVG + card overlay ──────────────────────────────────────────
+    # Desktop: horizontal court SVG followed by card grid rows
+    # Mobile: handled via CSS media query on .card-grid-mobile (portrait SVG)
+
+    # Away cards (top) + court SVG + home cards (bottom)
+    # Rendered with CSS grid for simple consistent layout.
+
+    # ── Away row ─────────────────────────────────────────────────────────
+    if away_top5:
+        away_html = '<div class="card-grid">'
+        for snap in away_top5:
+            away_html += _card_html(snap)
+        away_html += "</div>"
+        st.markdown(f"**{game['away_abbr']}** (away)", unsafe_allow_html=False)
+        st.markdown(away_html, unsafe_allow_html=True)
+    else:
+        st.caption(f"{game['away_abbr']}: lineup not yet available")
+
+    # ── Court SVG (CSS-responsive: horizontal desktop / vertical mobile) ──
+    desktop_svg = court_svg_desktop()
+    mobile_svg  = court_svg_mobile()
+
+    st.markdown(
+        f"""
+        <div class="court-wrap">
+          <div class="court-svg-layer" id="court-desktop"
+               style="display:block">
+            {desktop_svg}
+          </div>
+          <div class="court-svg-layer" id="court-mobile"
+               style="display:none; max-width:340px; margin:0 auto">
+            {mobile_svg}
+          </div>
+        </div>
+        <style>
+          @media (max-width: 767px) {{
+            #court-desktop {{ display: none !important; }}
+            #court-mobile  {{ display: block !important; }}
+          }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Home row ──────────────────────────────────────────────────────────
+    if home_top5:
+        st.markdown(f"**{game['home_abbr']}** (home)", unsafe_allow_html=False)
+        home_html = '<div class="card-grid">'
+        for snap in home_top5:
+            home_html += _card_html(snap)
+        home_html += "</div>"
+        st.markdown(home_html, unsafe_allow_html=True)
+    else:
+        st.caption(f"{game['home_abbr']}: lineup not yet available")
+
+    # ── Bio card click handler via Streamlit buttons ──────────────────────
+    st.markdown("---")
+    st.caption("Click a player card above, or select below to view their bio:")
+    all_snaps = home_top5 + away_top5
+    if all_snaps:
+        names = [f"{s.player_name} ({s.position})" for s in all_snaps]
+        chosen = st.selectbox("Player bio", ["—"] + names, key="bio_select", label_visibility="collapsed")
+        if chosen != "—":
+            idx = names.index(chosen)
+            st.session_state["active_player_id"] = all_snaps[idx].player_id
             st.rerun()
 
-    # Top-10 table
-    with st.expander("Top 10 — Combined Score (Dragon + Fortress)"):
-        if "COMBINED_SCORE" in nba_df.columns:
-            show_cols = [c for c in [
-                "PLAYER_NAME", "TEAM_ABBREVIATION",
-                "DRAGON_INDEX", "FORTRESS_RATING", "COMBINED_SCORE", "MIN",
-            ] if c in nba_df.columns]
-            st.dataframe(
-                nba_df.nlargest(10, "COMBINED_SCORE")[show_cols].round(1),
-                use_container_width=True, hide_index=True,
-            )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🐉 DRAGON LEADERBOARD
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_dragon:
-    st.markdown("#### Dragon Index — Top 20 Disruptors")
-    st.caption(
-        "Active disruption: steals, deflections, charges drawn, "
-        "perimeter contests (excl. rim), loose balls recovered"
+    # ── Auto-refresh every 30 s ───────────────────────────────────────────
+    st.markdown(
+        '<meta http-equiv="refresh" content="30">',
+        unsafe_allow_html=True,
     )
 
-    if "DRAGON_INDEX" in nba_df.columns:
-        dragon_fig = plot_leaderboard(nba_df, metric="DRAGON_INDEX", n=20)
-        st.plotly_chart(dragon_fig, use_container_width=True)
 
-        with st.expander("Full Dragon Index table — Top 50"):
-            dcols = [c for c in [
-                "PLAYER_NAME", "TEAM_ABBREVIATION", "POSITION",
-                "DRAGON_INDEX", "STL", "DEFLECTIONS",
-                "CHARGES_DRAWN", "MIN",
-            ] if c in nba_df.columns]
-            st.dataframe(
-                nba_df.nlargest(50, "DRAGON_INDEX")[dcols].round(2),
-                use_container_width=True, hide_index=True,
-            )
-    else:
-        st.warning("Dragon Index not found — refresh data.")
+# ══════════════════════════════════════════════════════════════════════════════
+# SEASON ANALYTICS (moved from old app.py into a function)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # Component weight explainer
-    with st.expander("How Dragon Index is computed"):
-        st.markdown("""
-        | Component | Weight | Why |
-        |---|---|---|
-        | Steals | 25% | Direct possession change |
-        | Deflections | 25% | Forces bad passes / turnovers |
-        | Charges drawn | 20% | Elite anticipation & positioning |
-        | Perimeter contests | 20% | Closest defender on mid-range + 3pt shots (rim excluded) |
-        | Loose balls recovered | 10% | Effort plays in transition |
+def _render_season_tabs(nba_df: pd.DataFrame) -> None:
+    if nba_df.empty:
+        st.warning("Season data unavailable — check nba_api connection.")
+        return
 
-        Raw scores are min-max normalised per component, then weighted.
-        A usage-rate and opponent-turnover-quality multiplier (0.6–1.0) rewards players
-        who produce disruption against high-usage opponents.
-        """)
+    pos_opts   = ["All", "Guards", "Wings", "Bigs"]
+    pos_map    = {"All": None, "Guards": "Guard", "Wings": "Wing", "Bigs": "Big"}
+    sel_pos    = st.radio("Position Filter", pos_opts, horizontal=True, key="pos_filter_season")
+    pos_filter = pos_map[sel_pos]
 
+    # Aggregate banner
+    if "COMBINED_SCORE" in nba_df.columns:
+        filt_df = nba_df if pos_filter is None else nba_df[nba_df.get("POSITION", pd.Series()) == pos_filter]
+        if not filt_df.empty and "DRAGON_INDEX" in filt_df.columns:
+            top_dragon   = filt_df.nlargest(1, "DRAGON_INDEX").iloc[0]
+            top_fortress = filt_df.nlargest(1, "FORTRESS_RATING").iloc[0]
+            top_combined = filt_df.nlargest(1, "COMBINED_SCORE").iloc[0]
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("Players loaded", len(filt_df))
+            b2.metric("🐉 Dragon #1",   top_dragon.get("PLAYER_NAME", "").split()[-1],
+                      f"{top_dragon['DRAGON_INDEX']:.1f}")
+            b3.metric("🏰 Fortress #1", top_fortress.get("PLAYER_NAME", "").split()[-1],
+                      f"{top_fortress['FORTRESS_RATING']:.1f}")
+            b4.metric("⭐ Best Combined", top_combined.get("PLAYER_NAME", "").split()[-1],
+                      f"{top_combined['COMBINED_SCORE']:.1f}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🏰 FORTRESS LEADERBOARD
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_fortress:
-    st.markdown("#### Fortress Rating — Top 20 Interior Anchors")
-    st.caption(
-        "Paint protection: rim FG% allowed, box-out rate, blocks, "
-        "rim contest rate, offensive rebound putbacks"
-    )
+    st.markdown("---")
 
-    if "FORTRESS_RATING" in nba_df.columns:
-        fortress_fig = plot_leaderboard(nba_df, metric="FORTRESS_RATING", n=20)
-        st.plotly_chart(fortress_fig, use_container_width=True)
+    if "compare_ids" not in st.session_state:
+        st.session_state["compare_ids"] = []
 
-        with st.expander("Full Fortress Rating table — Top 50"):
-            fcols = [c for c in [
-                "PLAYER_NAME", "TEAM_ABBREVIATION", "POSITION",
-                "FORTRESS_RATING", "BLK", "DREB",
-                "TRK_DEF_RIM_FG_PCT", "DEF_BOXOUTS", "MIN",
-            ] if c in nba_df.columns]
-            st.dataframe(
-                nba_df.nlargest(50, "FORTRESS_RATING")[fcols].round(2),
-                use_container_width=True, hide_index=True,
-            )
-    else:
-        st.warning("Fortress Rating not found — refresh data.")
+    (tab_bubble, tab_dragon, tab_fortress,
+     tab_compare, tab_teams) = st.tabs([
+        "🫧 Bubble Scatter", "🐉 Dragon LB", "🏰 Fortress LB",
+        "⚔️ Compare", "🏟️ Team View",
+    ])
 
-    with st.expander("How Fortress Rating is computed"):
-        st.markdown("""
-        | Component | Weight | Why |
-        |---|---|---|
-        | Rim FG% allowed (inverted) | 28% | Core measure of paint deterrence |
-        | Box-out rate | 22% | Contested rebound positioning |
-        | Blocks per game | 22% | Direct shot rejection |
-        | Rim contest rate (per 36 min) | 18% | Volume of rim presence |
-        | Putback contribution | 10% | Offensive rebound leverage |
+    # ── Bubble Scatter ────────────────────────────────────────────────────
+    with tab_bubble:
+        st.markdown("#### Dragon Index vs Fortress Rating")
+        st.caption("Bubble size ∝ minutes · click any bubble to queue for comparison")
+        highlight_ids = st.session_state.get("compare_ids", [])
+        bubble_fig    = plot_bubble_scatter(nba_df, position_filter=pos_filter,
+                                            highlight_ids=highlight_ids)
+        event = st.plotly_chart(bubble_fig, use_container_width=True,
+                                on_select="rerun", key="bubble_chart")
+        try:
+            if event and event.get("selection", {}).get("points"):
+                for pt in event["selection"]["points"]:
+                    cd  = pt.get("customdata") or []
+                    pid = int(cd[6]) if len(cd) > 6 else None
+                    if pid and pid not in st.session_state["compare_ids"]:
+                        if len(st.session_state["compare_ids"]) >= 3:
+                            st.session_state["compare_ids"].pop(0)
+                        st.session_state["compare_ids"].append(pid)
+                st.rerun()
+        except Exception:
+            pass
 
-        Normalised scores are multiplied by a paint-weight factor that rewards
-        players whose blocks + defensive rebounds rank highly relative to the league.
-        """)
+        if st.session_state["compare_ids"]:
+            cids  = st.session_state["compare_ids"]
+            names = (nba_df[nba_df["PLAYER_ID"].isin(cids)]["PLAYER_NAME"].tolist()
+                     if "PLAYER_NAME" in nba_df.columns else [str(i) for i in cids])
+            st.caption(f"**Compare queue:** {', '.join(names)}  →  go to ⚔️ Compare tab")
+            if st.button("Clear selection", key="clear_sel"):
+                st.session_state["compare_ids"] = []
+                st.rerun()
 
+        with st.expander("Top 10 — Combined Score"):
+            if "COMBINED_SCORE" in nba_df.columns:
+                show_cols = [c for c in ["PLAYER_NAME", "TEAM_ABBREVIATION",
+                    "DRAGON_INDEX", "FORTRESS_RATING", "COMBINED_SCORE", "MIN"]
+                    if c in nba_df.columns]
+                st.dataframe(nba_df.nlargest(10, "COMBINED_SCORE")[show_cols].round(1),
+                             use_container_width=True, hide_index=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ⚔️ PLAYER COMPARISON
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_compare:
-    st.markdown("#### Player Comparison")
-    st.caption("Select 2–3 players to compare across all defensive components")
+    # ── Dragon Leaderboard ────────────────────────────────────────────────
+    with tab_dragon:
+        st.markdown("#### Dragon Index — Top 20 Disruptors")
+        if "DRAGON_INDEX" in nba_df.columns:
+            st.plotly_chart(plot_leaderboard(nba_df, metric="DRAGON_INDEX", n=20),
+                            use_container_width=True)
+            with st.expander("Full Dragon Index table — Top 50"):
+                dcols = [c for c in ["PLAYER_NAME", "TEAM_ABBREVIATION", "POSITION",
+                    "DRAGON_INDEX", "STL", "DEFLECTIONS", "CHARGES_DRAWN", "MIN"]
+                    if c in nba_df.columns]
+                st.dataframe(nba_df.nlargest(50, "DRAGON_INDEX")[dcols].round(2),
+                             use_container_width=True, hide_index=True)
+        with st.expander("How Dragon Index is computed"):
+            st.markdown("""
+| Component | Weight | Why |
+|---|---|---|
+| Steals | 25% | Direct possession change |
+| Deflections | 25% | Forces bad passes |
+| Charges drawn | 20% | Elite anticipation |
+| Perimeter contests | 20% | Mid-range + 3pt contests |
+| Loose balls | 10% | Effort plays |
+            """)
 
-    player_names = (
-        sorted(nba_df["PLAYER_NAME"].dropna().tolist())
-        if "PLAYER_NAME" in nba_df.columns else []
-    )
+    # ── Fortress Leaderboard ──────────────────────────────────────────────
+    with tab_fortress:
+        st.markdown("#### Fortress Rating — Top 20 Interior Anchors")
+        if "FORTRESS_RATING" in nba_df.columns:
+            st.plotly_chart(plot_leaderboard(nba_df, metric="FORTRESS_RATING", n=20),
+                            use_container_width=True)
+            with st.expander("Full Fortress table — Top 50"):
+                fcols = [c for c in ["PLAYER_NAME", "TEAM_ABBREVIATION", "POSITION",
+                    "FORTRESS_RATING", "BLK", "DREB", "TRK_DEF_RIM_FG_PCT",
+                    "DEF_BOXOUTS", "MIN"] if c in nba_df.columns]
+                st.dataframe(nba_df.nlargest(50, "FORTRESS_RATING")[fcols].round(2),
+                             use_container_width=True, hide_index=True)
+        with st.expander("How Fortress Rating is computed"):
+            st.markdown("""
+| Component | Weight | Why |
+|---|---|---|
+| Rim FG% allowed (inv.) | 28% | Paint deterrence |
+| Box-out rate | 22% | Contested rebounds |
+| Blocks per game | 22% | Shot rejection |
+| Rim contest rate | 18% | Paint volume |
+| Putback contribution | 10% | Offensive rebound leverage |
+            """)
 
-    # Pre-populate from bubble-click session state
-    presel = []
-    if st.session_state["compare_ids"] and "PLAYER_NAME" in nba_df.columns:
-        presel = nba_df[
-            nba_df["PLAYER_ID"].isin(st.session_state["compare_ids"])
-        ]["PLAYER_NAME"].tolist()
-
-    comp_sel = st.multiselect(
-        "Select up to 3 players (or click bubbles on the Scatter tab)",
-        player_names,
-        default=presel[:3],
-        max_selections=3,
-        key="comp_sel",
-    )
-
-    if len(comp_sel) >= 2:
-        comp_df = nba_df[nba_df["PLAYER_NAME"].isin(comp_sel)]
-
-        # Radar + rolling trend side-by-side
-        c_rad, c_roll = st.columns(2)
-        with c_rad:
-            radar_fig = plot_comparison_radar(comp_df)
-            st.plotly_chart(radar_fig, use_container_width=True)
-
-        with c_roll:
-            roll_metric = st.selectbox(
-                "Rolling trend metric",
-                ["DRAGON_INDEX", "FORTRESS_RATING"],
-                key="roll_metric",
-            )
-            rolling_data = {}
-            for pname in comp_sel:
-                pid_row = nba_df[nba_df["PLAYER_NAME"] == pname]
-                if not pid_row.empty:
-                    pid = int(pid_row.iloc[0]["PLAYER_ID"])
-                    with st.spinner(f"Loading rolling data for {pname}…"):
-                        rolling_data[pname] = get_player_rolling_trend(
-                            pid, metric=roll_metric
-                        )
-            if rolling_data:
-                roll_fig = plot_comparison_rolling(rolling_data, metric=roll_metric)
-                st.plotly_chart(roll_fig, use_container_width=True)
-
-        # Raw stat table
-        st.markdown("---")
-        stat_cols = [c for c in [
-            "PLAYER_NAME", "TEAM_ABBREVIATION", "POSITION",
-            "DRAGON_INDEX", "FORTRESS_RATING", "COMBINED_SCORE",
-            "STL", "BLK", "DREB", "MIN", "USG_PCT", "DEF_RATING",
-        ] if c in comp_df.columns]
-        st.markdown('<div class="sec-hdr">Season Stats Comparison</div>',
-                    unsafe_allow_html=True)
-        st.dataframe(comp_df[stat_cols].round(2), use_container_width=True, hide_index=True)
-
-        # ── Play Sequence Impact (steal → points chain) ───────────────────────
-        st.markdown("---")
-        st.markdown("#### Steal → Points Chain Analysis")
-        st.caption(
-            "Every steal in the last N games is traced through play-by-play data. "
-            "We record whether the team scored, how quickly (fast break = within 2 plays), "
-            "and how many points were generated."
-        )
-
-        n_games_seq = st.slider(
-            "Games to analyse", min_value=5, max_value=20, value=10, step=5,
-            key="seq_games",
-        )
-
-        seq_data:   dict[str, dict] = {}
-        seq_colors: list[str]       = ["#EB6E1F", "#3498db", "#2ecc71", "#e74c3c"]
-
-        for pname in comp_sel:
-            pid_row = nba_df[nba_df["PLAYER_NAME"] == pname]
-            if pid_row.empty:
-                continue
-            pid = int(pid_row.iloc[0]["PLAYER_ID"])
-            with st.spinner(f"Tracing steal chains for {pname} ({n_games_seq} games)…"):
-                seq_data[pname] = get_play_sequence_stats(pid, n_games=n_games_seq)
-
-        if seq_data:
-            # Per-player Sankey diagrams
-            sank_cols = st.columns(len(seq_data))
-            for col, (pname, sdata) in zip(sank_cols, seq_data.items()):
-                with col:
-                    sank_fig = plot_steal_chain_sankey(sdata, pname)
-                    st.plotly_chart(sank_fig, use_container_width=True)
-
-            # Summary table
-            rows = []
-            for pname, sdata in seq_data.items():
-                rows.append({
-                    "Player":         pname,
-                    "Steals Traced":  sdata.get("total_steals", 0),
-                    "Scored %":       f"{sdata.get('conversion_pct', 0):.0f}%",
-                    "Fast Break %":   f"{sdata.get('fast_break_pct', 0):.0f}%",
-                    "Pts / Steal":    f"{sdata.get('pts_per_steal', 0):.2f}",
-                    "Total Pts Gen.": sdata.get("total_pts", 0),
-                    "Games":          sdata.get("games_analyzed", 0),
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-            # Multi-player comparison bars
-            if len(seq_data) > 1:
-                comp_seq_fig = plot_sequence_comparison(seq_data, colors=seq_colors)
-                st.plotly_chart(comp_seq_fig, use_container_width=True)
-
-    else:
-        st.info(
-            "Select 2 or 3 players from the dropdown above, "
-            "or click player bubbles on the 🫧 Bubble Scatter tab to queue them."
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🏟️ TEAM VIEW
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_teams:
-    st.markdown("#### Team Aggregate Defensive Metrics")
-    st.caption(
-        "Average Dragon Index & Fortress Rating across all qualifying players "
-        "(≥ 10 GP) per team"
-    )
-
-    try:
-        team_df = get_team_aggregates(nba_df)
-        if not team_df.empty:
-            team_fig = plot_team_bubbles(team_df)
-            st.plotly_chart(team_fig, use_container_width=True)
-
-            with st.expander("Team data table"):
-                tcols = [c for c in [
-                    "TEAM_ABBREVIATION", "TEAM_NAME",
-                    "DRAGON_INDEX", "FORTRESS_RATING",
-                    "COMBINED_SCORE", "PLAYER_COUNT",
-                ] if c in team_df.columns]
-                st.dataframe(
-                    team_df.sort_values("COMBINED_SCORE", ascending=False)[tcols].round(1),
-                    use_container_width=True, hide_index=True,
-                )
+    # ── Compare ───────────────────────────────────────────────────────────
+    with tab_compare:
+        st.markdown("#### Player Comparison")
+        player_names = (sorted(nba_df["PLAYER_NAME"].dropna().tolist())
+                        if "PLAYER_NAME" in nba_df.columns else [])
+        presel = []
+        if st.session_state["compare_ids"] and "PLAYER_NAME" in nba_df.columns:
+            presel = nba_df[nba_df["PLAYER_ID"].isin(st.session_state["compare_ids"])][
+                "PLAYER_NAME"].tolist()
+        comp_sel = st.multiselect("Select up to 3 players",
+                                  player_names, default=presel[:3],
+                                  max_selections=3, key="comp_sel")
+        if len(comp_sel) >= 2:
+            comp_df = nba_df[nba_df["PLAYER_NAME"].isin(comp_sel)]
+            c_rad, c_roll = st.columns(2)
+            with c_rad:
+                st.plotly_chart(plot_comparison_radar(comp_df), use_container_width=True)
+            with c_roll:
+                roll_metric = st.selectbox("Rolling metric",
+                                           ["DRAGON_INDEX", "FORTRESS_RATING"],
+                                           key="roll_metric")
+                rolling_data = {}
+                for pname in comp_sel:
+                    pid_row = nba_df[nba_df["PLAYER_NAME"] == pname]
+                    if not pid_row.empty:
+                        pid = int(pid_row.iloc[0]["PLAYER_ID"])
+                        with st.spinner(f"Loading {pname}…"):
+                            rolling_data[pname] = get_player_rolling_trend(
+                                pid, metric=roll_metric)
+                if rolling_data:
+                    st.plotly_chart(plot_comparison_rolling(rolling_data, metric=roll_metric),
+                                    use_container_width=True)
+            st.markdown("---")
+            stat_cols = [c for c in ["PLAYER_NAME", "TEAM_ABBREVIATION", "POSITION",
+                "DRAGON_INDEX", "FORTRESS_RATING", "COMBINED_SCORE",
+                "STL", "BLK", "DREB", "MIN"] if c in comp_df.columns]
+            st.dataframe(comp_df[stat_cols].round(2), use_container_width=True, hide_index=True)
         else:
-            st.info("No team aggregate data — refresh data first.")
-    except Exception as e:
-        st.error(f"Could not compute team aggregates: {e}")
+            st.info("Select 2–3 players or click bubbles on the Scatter tab.")
+
+    # ── Team View ─────────────────────────────────────────────────────────
+    with tab_teams:
+        st.markdown("#### Team Aggregate Defensive Metrics")
+        try:
+            team_df = get_team_aggregates(nba_df)
+            if not team_df.empty:
+                st.plotly_chart(plot_team_bubbles(team_df), use_container_width=True)
+                with st.expander("Team data table"):
+                    tcols = [c for c in ["TEAM_ABBREVIATION", "TEAM_NAME",
+                        "DRAGON_INDEX", "FORTRESS_RATING", "COMBINED_SCORE", "PLAYER_COUNT"]
+                        if c in team_df.columns]
+                    st.dataframe(
+                        team_df.sort_values("COMBINED_SCORE", ascending=False)[tcols].round(1),
+                        use_container_width=True, hide_index=True)
+            else:
+                st.info("No team data — refresh.")
+        except Exception as e:
+            st.error(f"Team aggregates error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN PAGE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_admin() -> None:
+    st.markdown("## 🔒 Admin Dashboard")
+
+    if not st.session_state.get("admin_auth"):
+        pw = st.text_input("Password", type="password", key="admin_pw")
+        if st.button("Unlock", key="admin_unlock"):
+            if hashlib.sha256(pw.encode()).hexdigest() == _ADMIN_PW_HASH:
+                st.session_state["admin_auth"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+        return
+
+    # Logged in
+    if st.button("🔓 Lock", key="admin_lock"):
+        st.session_state["admin_auth"] = False
+        st.rerun()
+
+    stats = analytics.get_stats(days=30)
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    metrics = [
+        ("Sessions (30d)",   stats["total_sessions"]),
+        ("Unique visitors",  stats["unique_visitors"]),
+        ("Page views (30d)", stats["total_page_views"]),
+        ("Sessions today",   stats["sessions_today"]),
+        ("Visitors today",   stats["visitors_today"]),
+        ("Views today",      stats["page_views_today"]),
+    ]
+    for col, (label, val) in zip([c1, c2, c3, c4, c5, c6], metrics):
+        col.markdown(
+            f'<div class="admin-metric"><div class="val">{val}</div>'
+            f'<div class="lbl">{label}</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+
+    col_paths, col_daily = st.columns(2)
+
+    with col_paths:
+        st.markdown("**Top paths (30d)**")
+        if stats["top_paths"]:
+            st.dataframe(
+                pd.DataFrame(stats["top_paths"]),
+                use_container_width=True, hide_index=True,
+            )
+
+    with col_daily:
+        st.markdown("**Daily views (30d)**")
+        if stats["daily_views"]:
+            import plotly.graph_objects as go
+            daily = pd.DataFrame(stats["daily_views"])
+            fig = go.Figure(go.Bar(
+                x=daily["date"], y=daily["count"],
+                marker_color="#EB6E1F",
+            ))
+            fig.update_layout(
+                paper_bgcolor="#0a0a0f", plot_bgcolor="#0a0a0f",
+                font_color="#aaa", margin=dict(l=0, r=0, t=10, b=0),
+                height=200,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("**Recent sessions**")
+    sessions = analytics.get_recent_sessions(50)
+    if sessions:
+        st.dataframe(pd.DataFrame(sessions), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No session data yet.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOP-LEVEL NAV + ROUTING
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Sidebar nav
+with st.sidebar:
+    st.markdown("## 🏀 GS+ Live")
+    st.markdown(f"*Season {SEASON}*")
+    st.markdown("---")
+    nav = st.radio(
+        "Navigate",
+        ["🏠 Live Court", "📊 Season", "🔧 Admin"],
+        key="nav",
+        label_visibility="collapsed",
+    )
+    st.markdown("---")
+    if st.button("🔄 Refresh data"):
+        st.cache_data.clear()
+        st.rerun()
+    st.caption("GS+ data refreshes every 30 s · Season analytics cached 24 h")
+
+# Load season data (non-blocking)
+with st.spinner("Loading season data (cached 24 h)…"):
+    try:
+        sdf = _season_df()
+    except Exception:
+        sdf = pd.DataFrame()
+
+# ── Player bio override (highest priority) ────────────────────────────────────
+if st.session_state.get("active_player_id") is not None:
+    render_bio_page(int(st.session_state["active_player_id"]), sdf)
+
+elif nav == "🏠 Live Court":
+    render_homepage(sdf)
+
+elif nav == "📊 Season":
+    st.markdown("# 📊 Season Analytics")
+    st.markdown(
+        '<span class="metric-pill dragon-pill">🐉 Dragon Index</span>'
+        '<span class="metric-pill fortress-pill">🏰 Fortress Rating</span>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("")
+    _render_season_tabs(sdf)
+
+elif nav == "🔧 Admin":
+    render_admin()
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.caption(
-    f"Season: **{SEASON}** · Data: nba_api (official NBA stats) · "
-    "Cached 24 h to disk · Min 10 GP to qualify"
+    f"GS+ Live Momentum Engine · Season {SEASON} · "
+    "nba_api · Cached 30 s live / 24 h season"
 )
