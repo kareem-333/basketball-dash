@@ -427,30 +427,65 @@ def get_live_games() -> list[dict]:
 
 # ── Season norm lookup ────────────────────────────────────────────────────────
 
-# League-wide GS+ average (used when player-specific baseline is unavailable)
-LEAGUE_AVG_GS_PLUS = 8.0
+# League-wide GS+ average — ~10 is realistic for a rotation player's single game
+LEAGUE_AVG_GS_PLUS = 10.0
 
 _norm_cache: dict[int, float] = {}
+_MISSING_NORMS_LOGGED: set[int] = set()
 
 
 def get_player_season_norm(player_id: int, season_df: "pd.DataFrame | None" = None) -> float:
     """
-    Return a player's season GS+ baseline.
-    Uses season_df if provided (must have PLAYER_ID and GS_PLUS_NORM columns),
-    otherwise returns league average.
+    Return a player's season GS+ baseline.  Uses season_df when available.
+    Falls back to LEAGUE_AVG_GS_PLUS (10.0) — never returns 0 to avoid
+    division issues in percentage math.
     """
+    import warnings
+
     if player_id in _norm_cache:
         return _norm_cache[player_id]
 
-    norm = LEAGUE_AVG_GS_PLUS
-    if season_df is not None and not season_df.empty:
-        if "GS_PLUS_NORM" in season_df.columns and "PLAYER_ID" in season_df.columns:
-            row = season_df[season_df["PLAYER_ID"] == player_id]
-            if not row.empty:
-                norm = float(row.iloc[0]["GS_PLUS_NORM"])
+    if season_df is None or (hasattr(season_df, "empty") and season_df.empty):
+        if player_id not in _MISSING_NORMS_LOGGED:
+            warnings.warn(
+                f"Season norm: season_df is empty — using league fallback for player {player_id}",
+                stacklevel=2,
+            )
+            _MISSING_NORMS_LOGGED.add(player_id)
+        _norm_cache[player_id] = LEAGUE_AVG_GS_PLUS
+        return LEAGUE_AVG_GS_PLUS
 
-    _norm_cache[player_id] = norm
-    return norm
+    if "PLAYER_ID" not in season_df.columns:
+        _norm_cache[player_id] = LEAGUE_AVG_GS_PLUS
+        return LEAGUE_AVG_GS_PLUS
+
+    row = season_df[season_df["PLAYER_ID"] == player_id]
+
+    if row.empty:
+        if player_id not in _MISSING_NORMS_LOGGED:
+            warnings.warn(
+                f"Season norm: no row for player_id={player_id} — using league fallback",
+                stacklevel=2,
+            )
+            _MISSING_NORMS_LOGGED.add(player_id)
+        _norm_cache[player_id] = LEAGUE_AVG_GS_PLUS
+        return LEAGUE_AVG_GS_PLUS
+
+    if "GS_PLUS_NORM" in row.columns:
+        v = float(row.iloc[0]["GS_PLUS_NORM"])
+        if v and v > 0:
+            _norm_cache[player_id] = v
+            return v
+
+    # GS_PLUS_NORM column missing or zero — use fallback
+    if player_id not in _MISSING_NORMS_LOGGED:
+        warnings.warn(
+            f"Season norm: GS_PLUS_NORM missing/zero for player_id={player_id}",
+            stacklevel=2,
+        )
+        _MISSING_NORMS_LOGGED.add(player_id)
+    _norm_cache[player_id] = LEAGUE_AVG_GS_PLUS
+    return LEAGUE_AVG_GS_PLUS
 
 
 def compute_gs_plus_norm_from_pipeline(pipeline_df: "pd.DataFrame") -> "pd.DataFrame":

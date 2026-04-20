@@ -22,16 +22,55 @@ from nba.pipeline import nba_headshot_url, team_color, get_play_sequence_stats
 
 # ── Shared dark theme ─────────────────────────────────────────────────────────
 
-_DARK = dict(
-    plot_bgcolor  = "#0e1117",
-    paper_bgcolor = "#0e1117",
-    font          = dict(color="#e0e0e0", family="Inter, Arial, sans-serif"),
+DARK_LAYOUT = dict(
+    paper_bgcolor="#0a0a0f",
+    plot_bgcolor="#0d0d1a",
+    font=dict(color="#E6EDF3", size=12, family="Inter, sans-serif"),
+    xaxis=dict(
+        gridcolor="#1a1a2e",
+        zerolinecolor="#2a2a3a",
+        tickfont=dict(color="#cccccc"),
+        title=dict(font=dict(color="#E6EDF3")),
+    ),
+    yaxis=dict(
+        gridcolor="#1a1a2e",
+        zerolinecolor="#2a2a3a",
+        tickfont=dict(color="#cccccc"),
+        title=dict(font=dict(color="#E6EDF3")),
+    ),
+    legend=dict(font=dict(color="#E6EDF3"), bgcolor="rgba(0,0,0,0)"),
+    hoverlabel=dict(
+        bgcolor="#1a1a2e",
+        font=dict(color="#ffffff", size=12),
+        bordercolor="#EB6E1F",
+    ),
 )
+
+# Keep _DARK for backwards compat with _layout()
+_DARK = dict(
+    plot_bgcolor  = DARK_LAYOUT["plot_bgcolor"],
+    paper_bgcolor = DARK_LAYOUT["paper_bgcolor"],
+    font          = DARK_LAYOUT["font"],
+)
+
 
 def _layout(**kw):
     base = dict(**_DARK, margin=dict(l=20, r=20, t=55, b=20))
     base.update(kw)
     return base
+
+
+def apply_dark_theme(fig):
+    """Apply full dark theme to any Plotly figure. Call before return."""
+    fig.update_layout(**DARK_LAYOUT)
+    # Force annotation text to be light — Plotly sometimes resets to grey
+    for ann in (fig.layout.annotations or []):
+        try:
+            if not ann.font or not ann.font.color:
+                ann.font = dict(color="#E6EDF3")
+        except Exception:
+            pass
+    return fig
 
 
 _DRAGON_COMP_COLORS   = ["#e74c3c", "#e67e22", "#f39c12", "#2ecc71", "#3498db"]
@@ -194,7 +233,12 @@ def plot_bubble_scatter(
         height=640,
         **_layout(margin=dict(l=60, r=20, t=60, b=60)),
     )
-    return fig
+    # FIX 9 — ensure all marker text labels are readable on dark bg
+    fig.update_traces(
+        textfont=dict(color="#E6EDF3", size=10),
+        selector=dict(mode="markers"),
+    )
+    return apply_dark_theme(fig)
 
 
 # ── 2 & 3. Leaderboard stacked bars ──────────────────────────────────────────
@@ -251,69 +295,99 @@ def plot_leaderboard(
         legend=dict(orientation="h", x=0, y=1.04, font=dict(size=9)),
         **_layout(margin=dict(l=210, r=80, t=80, b=30)),
     )
-    return fig
+    return apply_dark_theme(fig)
 
 
-# ── 4a. Comparison radar ──────────────────────────────────────────────────────
-
-_RADAR_CATS = [
-    "Deflections", "Charges/Steals", "Perimeter Contests",
-    "Blocks", "Box-Out Rate", "Putbacks",
-]
-
-
-def _radar_values(row: pd.Series) -> list[float]:
-    return [
-        float(row.get("d_defl_n",    0) * 100),
-        float((row.get("d_charges_n", 0) + row.get("d_steals_n", 0)) / 2 * 100),
-        float(row.get("d_perim_n",   0) * 100),
-        float(row.get("f_blocks_n",  0) * 100),
-        float(row.get("f_reb_n",     0) * 100),
-        float(row.get("f_putback_n", 0) * 100),
-    ]
-
+# ── 4a. Comparison radar (percentile-normalised — FIX 8) ─────────────────────
 
 def plot_comparison_radar(players_df: pd.DataFrame) -> go.Figure:
-    """Radar chart comparing up to 3 players across all metric components."""
+    """
+    Radar chart comparing up to 3 players on league percentile rank (0-100).
+    Uses *_PCTILE columns when available (added by pipeline FIX 8);
+    falls back to raw normalised component values scaled to 0-100.
+    """
     if players_df.empty:
         return go.Figure(layout=go.Layout(title="No players selected", **_layout()))
 
-    categories = _RADAR_CATS + [_RADAR_CATS[0]]
+    # Prefer percentile columns; fall back to raw normalised components
+    metrics = [
+        ("Dragon",      "DRAGON_INDEX_PCTILE",       "d_defl_n"),
+        ("Fortress",    "FORTRESS_RATING_PCTILE",     "f_rim_inv_n"),
+        ("Steals",      "STL_PCTILE",                 "d_steals_n"),
+        ("Deflections", "DEFLECTIONS_PCTILE",         "d_defl_n"),
+        ("Charges",     "CHARGES_DRAWN_PCTILE",       "d_charges_n"),
+        ("Blocks",      "BLK_PCTILE",                 "f_blocks_n"),
+        ("D.Rebounds",  "DREB_PCTILE",                "f_reb_n"),
+        ("Rim Def",     "TRK_DEF_RIM_FG_PCT_PCTILE",  "f_rim_rate_n"),
+    ]
+    # Select columns that exist in the DataFrame
+    used = []
+    for label, pctile_col, fallback_col in metrics:
+        if pctile_col in players_df.columns:
+            used.append((label, pctile_col, True))
+        elif fallback_col in players_df.columns:
+            used.append((label, fallback_col, False))
+
+    if not used:
+        return go.Figure(layout=go.Layout(title="Metric columns not found", **_layout()))
+
+    labels = [u[0] for u in used]
+    labels_closed = labels + [labels[0]]
+    palette = ["#EB6E1F", "#4A90D9", "#2ecc71", "#e74c3c"]
+
     fig = go.Figure()
-    fallback_colors = ["#EB6E1F", "#3498db", "#2ecc71"]
 
     for i, (_, row) in enumerate(players_df.head(3).iterrows()):
-        vals   = _radar_values(row) + [_radar_values(row)[0]]
-        color  = row.get("TEAM_COLOR", fallback_colors[i % 3])
-        if color.startswith("#") and len(color) == 7:
-            r2, g2, b2 = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
-            fill = f"rgba({r2},{g2},{b2},0.15)"
-        else:
-            fill = "rgba(128,128,128,0.15)"
+        values = []
+        for label, col, is_pctile in used:
+            v = float(row.get(col, 0) or 0)
+            # Raw normalised columns are 0-1; scale to 0-100
+            if not is_pctile:
+                v = v * 100
+            values.append(min(100, max(0, v)))
 
-        name = row.get("PLAYER_NAME", f"Player {i+1}")
-        team = row.get("TEAM_ABBREVIATION", "")
+        color = row.get("TEAM_COLOR", palette[i % len(palette)])
+        name  = row.get("PLAYER_NAME", f"Player {i+1}")
+        team  = row.get("TEAM_ABBREVIATION", "")
+
+        try:
+            r2, g2, b2 = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+            fill = f"rgba({r2},{g2},{b2},0.18)"
+        except Exception:
+            fill = "rgba(128,128,128,0.18)"
+
         fig.add_trace(go.Scatterpolar(
-            r=vals, theta=categories,
-            fill="toself", fillcolor=fill,
+            r=values + [values[0]],
+            theta=labels_closed,
+            fill="toself",
+            fillcolor=fill,
             line=dict(color=color, width=2),
             name=f"{name} ({team})" if team else name,
-            hovertemplate="%{theta}: %{r:.1f}<extra></extra>",
+            hovertemplate="%{theta}: %{r:.0f}th pctile<extra></extra>",
         ))
 
     fig.update_layout(
         polar=dict(
-            radialaxis=dict(visible=True, range=[0, 100],
-                            tickfont=dict(size=8, color="#aaa"),
-                            gridcolor="rgba(255,255,255,0.1)"),
-            angularaxis=dict(tickfont=dict(size=10), gridcolor="rgba(255,255,255,0.1)"),
-            bgcolor="#0e1117",
+            radialaxis=dict(
+                visible=True,
+                range=[0, 100],
+                gridcolor="#2a2a3a",
+                tickfont=dict(color="#cccccc", size=8),
+                tickvals=[0, 25, 50, 75, 100],
+                ticktext=["0", "25%", "50%", "75%", "99%"],
+            ),
+            angularaxis=dict(
+                gridcolor="#2a2a3a",
+                tickfont=dict(color="#E6EDF3", size=10),
+            ),
+            bgcolor="#0d0d1a",
         ),
-        title="Defensive Component Comparison",
-        showlegend=True, height=440,
+        title="Defensive Component Comparison (League Percentile)",
+        showlegend=True,
+        height=440,
         **_layout(margin=dict(l=50, r=50, t=70, b=50)),
     )
-    return fig
+    return apply_dark_theme(fig)
 
 
 # ── 4b. Comparison rolling trend ─────────────────────────────────────────────
@@ -350,7 +424,7 @@ def plot_comparison_rolling(rolling_data: dict[str, pd.DataFrame], metric: str) 
         height=320,
         **_layout(margin=dict(l=60, r=20, t=60, b=40)),
     )
-    return fig
+    return apply_dark_theme(fig)
 
 
 # ── 5. Team bubble view ───────────────────────────────────────────────────────
@@ -411,7 +485,7 @@ def plot_team_bubbles(team_df: pd.DataFrame) -> go.Figure:
         height=580,
         **_layout(margin=dict(l=60, r=20, t=60, b=60)),
     )
-    return fig
+    return apply_dark_theme(fig)
 
 
 # ── 6. Steal → Points chain Sankey ───────────────────────────────────────────
@@ -448,7 +522,7 @@ def plot_steal_chain_sankey(seq_stats: dict, player_name: str) -> go.Figure:
         height=380,
         **_layout(margin=dict(l=20, r=20, t=65, b=20)),
     )
-    return fig
+    return apply_dark_theme(fig)
 
 
 # ── 7. Multi-player steal-impact comparison ───────────────────────────────────
@@ -505,4 +579,4 @@ def plot_sequence_comparison(stats_dict: dict[str, dict], colors: list[str] | No
         legend=dict(orientation="h", x=0, y=1.07, font=dict(size=9)),
         **_layout(margin=dict(l=60, r=70, t=80, b=60)),
     )
-    return fig
+    return apply_dark_theme(fig)

@@ -58,7 +58,15 @@ from nba.court_svg import (
     DESKTOP_SLOTS,
     MOBILE_SLOTS,
 )
+import datetime
 import nba.analytics as analytics
+
+# ── Streamlit fragment support check (requires ≥ 1.33) ───────────────────────
+try:
+    _st_ver = tuple(int(x) for x in st.__version__.split(".")[:2])
+    _HAS_FRAGMENT = _st_ver >= (1, 33)
+except Exception:
+    _HAS_FRAGMENT = False
 
 # ── Admin password hash ───────────────────────────────────────────────────────
 _ADMIN_PW_HASH = hashlib.sha256(
@@ -81,12 +89,26 @@ body, [data-testid="stAppViewContainer"] {
   position: relative;
   width: 100%;
   max-width: 1100px;
-  margin: 0 auto;
+  margin: 12px auto;
+  aspect-ratio: 94 / 50;
   user-select: none;
 }
 .court-svg-layer {
+  position: absolute;
+  inset: 0;
   width: 100%;
-  display: block;
+  height: 100%;
+}
+.card-anchor {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: 17%;
+  min-width: 100px;
+  max-width: 160px;
+  z-index: 2;
+}
+@media (max-width: 767px) {
+  .court-wrap { aspect-ratio: 50 / 94; max-width: 380px; }
 }
 
 /* ── Player cards ────────────────────────────────────────────────────────── */
@@ -305,12 +327,67 @@ for key, default in [
 # Helper: season data (cached)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _season_hash(df: pd.DataFrame) -> str:
+    """Quick fingerprint of season_df for cache invalidation (FIX 5)."""
+    if df is None or df.empty:
+        return "empty"
+    try:
+        if "GS_PLUS_NORM" in df.columns:
+            return hashlib.md5(
+                f"{len(df)}_{df['GS_PLUS_NORM'].sum():.2f}".encode()
+            ).hexdigest()[:12]
+    except Exception:
+        pass
+    return hashlib.md5(f"{len(df)}".encode()).hexdigest()[:12]
+
+
+@st.cache_data(ttl=3_600, show_spinner=False)
+def _games_for_date(d: datetime.date) -> list[dict]:
+    """Fetch all games for a specific past date (FIX 4)."""
+    try:
+        from nba_api.stats.endpoints import scoreboardv2
+        time.sleep(0.5)
+        sb = scoreboardv2.ScoreboardV2(game_date=d.strftime("%m/%d/%Y"))
+        df = sb.game_header.get_data_frame()
+        ls = sb.line_score.get_data_frame()
+        out = []
+        for _, r in df.iterrows():
+            gid = str(r["GAME_ID"])
+            # Pull team abbreviations from line_score
+            ls_game = ls[ls["GAME_ID"] == gid] if "GAME_ID" in ls.columns else pd.DataFrame()
+            abbrs = ls_game["TEAM_ABBREVIATION"].tolist() if not ls_game.empty else ["", ""]
+            away_abbr = abbrs[0] if len(abbrs) > 0 else ""
+            home_abbr = abbrs[1] if len(abbrs) > 1 else ""
+            away_pts = int(ls_game.iloc[0]["PTS"] if not ls_game.empty else 0)
+            home_pts = int(ls_game.iloc[1]["PTS"] if len(ls_game) > 1 else 0)
+            out.append({
+                "game_id":      gid,
+                "home_team_id": int(r.get("HOME_TEAM_ID", 0) or 0),
+                "away_team_id": int(r.get("VISITOR_TEAM_ID", 0) or 0),
+                "home_abbr":    home_abbr,
+                "away_abbr":    away_abbr,
+                "home_score":   home_pts,
+                "away_score":   away_pts,
+                "period":       4,
+                "clock":        "Final",
+                "status":       "Final",
+                "is_live":      False,
+            })
+        return out
+    except Exception:
+        return []
+
+
 @st.cache_data(ttl=86_400, show_spinner=False)
 def _season_df() -> pd.DataFrame:
     try:
         df = get_all_player_metrics()
         if df is not None and not df.empty:
-            return compute_gs_plus_norm_from_pipeline(df)
+            result = compute_gs_plus_norm_from_pipeline(df)
+            # FIX 5 — sanity check
+            if "GS_PLUS_NORM" not in result.columns or result["GS_PLUS_NORM"].isna().all():
+                st.toast("⚠️ Season norms not computed — cards will use league fallback", icon="⚠️")
+            return result
     except Exception:
         pass
     return pd.DataFrame()
@@ -436,9 +513,16 @@ from nba.replay import (
     get_snapshots_at_frame,
 )
 
+_LIVE_STATUS_KEYWORDS = ("q1", "q2", "q3", "q4", "ot", "halftime", "end of")
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _live_games() -> list[dict]:
-    return get_live_games()
+    games = get_live_games()
+    for g in games:
+        status_lower = str(g.get("status", "")).lower()
+        g["is_live"] = any(kw in status_lower for kw in _LIVE_STATUS_KEYWORDS)
+    return games
 
 
 # ── Replay cached fetchers ────────────────────────────────────────────────────
@@ -485,7 +569,7 @@ def _live_snapshots(game_id: str, season_df_hash: str) -> list[GSPlusSnapshot]:
 # CARD HTML builder
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _card_html(snap: GSPlusSnapshot) -> str:
+def _card_html(snap: GSPlusSnapshot, debug_mode: bool = False) -> str:
     sign     = "+" if snap.pct_vs_norm >= 0 else ""
     pct_str  = f"{sign}{snap.pct_vs_norm:.0f}%"
     raw_str  = f"{snap.raw_gs_plus:+.1f}"
@@ -507,6 +591,13 @@ def _card_html(snap: GSPlusSnapshot) -> str:
 
     arrow = snap.velocity_arrow
 
+    # FIX 5 — optional debug row showing norm and raw GS+
+    debug_row = (
+        f'<div class="card-raw" style="color:#EB6E1F88;margin-top:2px;">'
+        f'norm {snap.season_norm:.1f} | raw {snap.raw_gs_plus:.1f}</div>'
+        if debug_mode else ""
+    )
+
     # Clicking the card sets active_player in session state via a query param hack
     # (Streamlit doesn't support onclick easily; we use st.button workarounds upstream)
     return f"""
@@ -522,6 +613,7 @@ def _card_html(snap: GSPlusSnapshot) -> str:
     {pct_str} {arrow}
   </div>
   <div class="card-label">vs. norm</div>
+  {debug_row}
 </div>
 """
 
@@ -646,7 +738,7 @@ def render_bio_page(player_id: int, season_df: pd.DataFrame) -> None:
     # ── Tonight's live GS+ (if applicable) ───────────────────────────────
     live_games = _live_games()
     for g in live_games:
-        for s in _live_snapshots(g["game_id"], ""):
+        for s in _live_snapshots(g["game_id"], _season_hash(season_df)):
             if s.player_id == player_id:
                 st.divider()
                 st.markdown("**Tonight — live GS+**")
@@ -656,6 +748,84 @@ def render_bio_page(player_id: int, season_df: pd.DataFrame) -> None:
                 lc2.metric("Raw GS+", f"{s.raw_gs_plus:+.1f}")
                 lc3.metric("Tier", s.tier)
                 break
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COURT + CARDS RENDERER (FIX 3)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _render_court_with_cards(
+    home_top5: "list[GSPlusSnapshot]",
+    away_top5: "list[GSPlusSnapshot]",
+    home_abbr: str,
+    away_abbr: str,
+    debug_mode: bool = False,
+) -> None:
+    """
+    Render the basketball court SVG with 10 player cards absolutely positioned
+    over it in the negative space (FIX 3).
+
+    Away team occupies the LEFT half, home team occupies the RIGHT half.
+    Slot coords are (left%, top%) as percentage of the .court-wrap container.
+    """
+    # Slot definitions matching DESKTOP_SLOTS from court_svg.py
+    LEFT_SLOTS  = {
+        "PG": (28, 50),
+        "SG": (15, 22),
+        "SF": (15, 78),
+        "PF": ( 4, 18),
+        "C":  ( 4, 82),
+    }
+    RIGHT_SLOTS = {
+        "PG": (72, 50),
+        "SG": (85, 22),
+        "SF": (85, 78),
+        "PF": (96, 18),
+        "C":  (96, 82),
+    }
+    POSITIONS = ["PG", "SG", "SF", "PF", "C"]
+
+    def _anchor(left_pct: float, top_pct: float, card_html: str) -> str:
+        return (
+            f'<div class="card-anchor" style="left:{left_pct}%;top:{top_pct}%;">'
+            f'{card_html}</div>'
+        )
+
+    # Build card HTML for all 10 slots
+    away_html = ""
+    for i, snap in enumerate(away_top5[:5]):
+        pos  = POSITIONS[i] if i < len(POSITIONS) else "PG"
+        slot = LEFT_SLOTS.get(pos, (10, 50))
+        away_html += _anchor(*slot, _card_html(snap, debug_mode=debug_mode))
+
+    home_html = ""
+    for i, snap in enumerate(home_top5[:5]):
+        pos  = POSITIONS[i] if i < len(POSITIONS) else "PG"
+        slot = RIGHT_SLOTS.get(pos, (90, 50))
+        home_html += _anchor(*slot, _card_html(snap, debug_mode=debug_mode))
+
+    svg_content = court_svg_desktop()
+
+    # Team label overlay (top corners of the wrapper)
+    away_label_html = (
+        f'<div style="position:absolute;left:1%;top:2%;'
+        f'font-size:11px;font-weight:700;color:#ccc;z-index:3;">{away_abbr}</div>'
+    )
+    home_label_html = (
+        f'<div style="position:absolute;right:1%;top:2%;'
+        f'font-size:11px;font-weight:700;color:#ccc;z-index:3;">{home_abbr}</div>'
+    )
+
+    html = (
+        '<div class="court-wrap">'
+        f'  <div class="court-svg-layer">{svg_content}</div>'
+        f'  {away_label_html}'
+        f'  {home_label_html}'
+        f'  {away_html}'
+        f'  {home_html}'
+        '</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -675,25 +845,48 @@ def render_homepage(season_df: pd.DataFrame) -> None:
     except Exception:
         pass
 
-    # ── Live game selector ────────────────────────────────────────────────
-    live_games = _live_games()
-    no_games = not live_games
+    # ── Date picker (FIX 4) ───────────────────────────────────────────────
+    date_col, info_col = st.columns([1, 4])
+    with date_col:
+        selected_date = st.date_input(
+            "Date",
+            value=datetime.date.today(),
+            max_value=datetime.date.today(),
+            key="homepage_date",
+            label_visibility="collapsed",
+        )
+    is_today = (selected_date == datetime.date.today())
+
+    if is_today:
+        games = _live_games()
+    else:
+        with st.spinner(f"Loading games for {selected_date}…"):
+            games = _games_for_date(selected_date)
+        if games:
+            info_col.info(
+                f"📅 {selected_date.strftime('%b %d, %Y')} — replay mode. "
+                "Pick a game, then use 🎬 Replay for the full scrubber."
+            )
 
     st.markdown("### 🏀 GS+ Live Momentum")
 
-    if no_games:
-        st.info(
-            "No live games right now. "
-            "The court will populate automatically when a game starts. "
-            "Check out 📊 Season analytics below."
+    if not games:
+        msg = (
+            "No live games right now. The court populates automatically when a game starts."
+            if is_today else f"No games found for {selected_date}."
         )
+        st.info(msg)
         _render_season_tabs(season_df)
         return
 
-    # Game selector chips (rendered as radio for Streamlit compatibility)
+    # ── Game selector ─────────────────────────────────────────────────────
     game_labels = {
-        g["game_id"]: f"{g['away_abbr']} @ {g['home_abbr']}  {g['away_score']}–{g['home_score']}  {g['status']}"
-        for g in live_games
+        g["game_id"]: (
+            f"{'🔴 ' if g.get('is_live') else ''}"
+            f"{g['away_abbr']} @ {g['home_abbr']}  "
+            f"{g['away_score']}–{g['home_score']}  {g['status']}"
+        )
+        for g in games
     }
     game_ids = list(game_labels.keys())
 
@@ -709,107 +902,73 @@ def render_homepage(season_df: pd.DataFrame) -> None:
         label_visibility="collapsed",
     )
     st.session_state["selected_game_id"] = sel
-    game = next(g for g in live_games if g["game_id"] == sel)
+    game = next(g for g in games if g["game_id"] == sel)
+
+    # Past date → shortcut to replay
+    if not is_today and not game.get("is_live"):
+        if st.button("🎬 Open in Replay", key="open_replay"):
+            st.session_state["nav"] = "🎬 Replay"
+            st.session_state["replay_game_sel"] = sel
+            st.rerun()
 
     # ── Team strip ────────────────────────────────────────────────────────
+    period_lbl = f"Q{game['period']}" if game["period"] <= 4 else f"OT{game['period']-4}"
     st.markdown(
         f'<div class="team-strip">'
         f'<span>{game["away_abbr"]}</span>'
         f'<span class="score">{game["away_score"]} – {game["home_score"]}</span>'
-        f'<span class="clock">Q{game["period"]}  {game["clock"]}</span>'
+        f'<span class="clock">{period_lbl}  {game["clock"]}</span>'
         f'<span>{game["home_abbr"]}</span>'
         f'</div>',
         unsafe_allow_html=True,
     )
 
-    # ── Fetch snapshots ───────────────────────────────────────────────────
-    with st.spinner("Loading live GS+…"):
-        snaps = _live_snapshots(game["game_id"], "")
+    # ── Cards on court — fragment auto-refreshes only while live (FIX 1) ──
+    run_interval = "30s" if game.get("is_live") else None
 
-    home_snaps = [s for s in snaps if s.team_id == game["home_team_id"]]
-    away_snaps = [s for s in snaps if s.team_id == game["away_team_id"]]
+    debug_mode = st.session_state.get("debug_mode", False)
 
-    # Sort by canonical position order
-    pos_order = {p: i for i, p in enumerate(POSITION_SLOTS)}
-    home_snaps.sort(key=lambda s: pos_order.get(s.position, 9))
-    away_snaps.sort(key=lambda s: pos_order.get(s.position, 9))
+    if _HAS_FRAGMENT:
+        @st.fragment(run_every=run_interval)
+        def _live_card_block():
+            snaps = _live_snapshots(game["game_id"], _season_hash(season_df))
+            pos_order = {p: i for i, p in enumerate(POSITION_SLOTS)}
+            home_snaps = sorted(
+                [s for s in snaps if s.team_id == game["home_team_id"]],
+                key=lambda s: pos_order.get(s.position, 9),
+            )
+            away_snaps = sorted(
+                [s for s in snaps if s.team_id == game["away_team_id"]],
+                key=lambda s: pos_order.get(s.position, 9),
+            )
+            _render_court_with_cards(
+                home_top5=home_snaps[:5],
+                away_top5=away_snaps[:5],
+                home_abbr=game["home_abbr"],
+                away_abbr=game["away_abbr"],
+                debug_mode=debug_mode,
+            )
 
-    # Take top 5 (starters / highest-minute players)
-    home_top5 = home_snaps[:5]
-    away_top5 = away_snaps[:5]
-
-    # ── Court SVG + card overlay ──────────────────────────────────────────
-    # Desktop: horizontal court SVG followed by card grid rows
-    # Mobile: handled via CSS media query on .card-grid-mobile (portrait SVG)
-
-    # Away cards (top) + court SVG + home cards (bottom)
-    # Rendered with CSS grid for simple consistent layout.
-
-    # ── Away row ─────────────────────────────────────────────────────────
-    if away_top5:
-        away_html = '<div class="card-grid">'
-        for snap in away_top5:
-            away_html += _card_html(snap)
-        away_html += "</div>"
-        st.markdown(f"**{game['away_abbr']}** (away)", unsafe_allow_html=False)
-        st.markdown(away_html, unsafe_allow_html=True)
+        _live_card_block()
     else:
-        st.caption(f"{game['away_abbr']}: lineup not yet available")
-
-    # ── Court SVG (CSS-responsive: horizontal desktop / vertical mobile) ──
-    desktop_svg = court_svg_desktop()
-    mobile_svg  = court_svg_mobile()
-
-    st.markdown(
-        f"""
-        <div class="court-wrap">
-          <div class="court-svg-layer" id="court-desktop"
-               style="display:block">
-            {desktop_svg}
-          </div>
-          <div class="court-svg-layer" id="court-mobile"
-               style="display:none; max-width:340px; margin:0 auto">
-            {mobile_svg}
-          </div>
-        </div>
-        <style>
-          @media (max-width: 767px) {{
-            #court-desktop {{ display: none !important; }}
-            #court-mobile  {{ display: block !important; }}
-          }}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # ── Home row ──────────────────────────────────────────────────────────
-    if home_top5:
-        st.markdown(f"**{game['home_abbr']}** (home)", unsafe_allow_html=False)
-        home_html = '<div class="card-grid">'
-        for snap in home_top5:
-            home_html += _card_html(snap)
-        home_html += "</div>"
-        st.markdown(home_html, unsafe_allow_html=True)
-    else:
-        st.caption(f"{game['home_abbr']}: lineup not yet available")
-
-    # ── Bio card click handler via Streamlit buttons ──────────────────────
-    st.markdown("---")
-    st.caption("Click a player card above, or select below to view their bio:")
-    all_snaps = home_top5 + away_top5
-    if all_snaps:
-        names = [f"{s.player_name} ({s.position})" for s in all_snaps]
-        chosen = st.selectbox("Player bio", ["—"] + names, key="bio_select", label_visibility="collapsed")
-        if chosen != "—":
-            idx = names.index(chosen)
-            st.session_state["active_player_id"] = all_snaps[idx].player_id
-            st.rerun()
-
-    # ── Auto-refresh every 30 s ───────────────────────────────────────────
-    st.markdown(
-        '<meta http-equiv="refresh" content="30">',
-        unsafe_allow_html=True,
-    )
+        # Fallback for Streamlit < 1.33 (no fragment support)
+        snaps = _live_snapshots(game["game_id"], _season_hash(season_df))
+        pos_order = {p: i for i, p in enumerate(POSITION_SLOTS)}
+        home_snaps = sorted(
+            [s for s in snaps if s.team_id == game["home_team_id"]],
+            key=lambda s: pos_order.get(s.position, 9),
+        )
+        away_snaps = sorted(
+            [s for s in snaps if s.team_id == game["away_team_id"]],
+            key=lambda s: pos_order.get(s.position, 9),
+        )
+        _render_court_with_cards(
+            home_top5=home_snaps[:5],
+            away_top5=away_snaps[:5],
+            home_abbr=game["home_abbr"],
+            away_abbr=game["away_abbr"],
+            debug_mode=debug_mode,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -975,6 +1134,23 @@ def _render_season_tabs(nba_df: pd.DataFrame) -> None:
                 "DRAGON_INDEX", "FORTRESS_RATING", "COMBINED_SCORE",
                 "STL", "BLK", "DREB", "MIN"] if c in comp_df.columns]
             st.dataframe(comp_df[stat_cols].round(2), use_container_width=True, hide_index=True)
+
+            # FIX 7 — Steal chain Sankey (restored)
+            st.markdown("---")
+            st.markdown("#### Steal-chain analysis")
+            st.caption(
+                "Sankey shows how steal-to-transition sequences originate and terminate "
+                "for each selected player (sample from season play sequences)."
+            )
+            try:
+                sankey_fig = plot_steal_chain_sankey(comp_df)
+                if sankey_fig is not None:
+                    st.plotly_chart(sankey_fig, use_container_width=True)
+                else:
+                    st.caption("Steal-chain data not available for selected players.")
+            except Exception as _e:
+                st.caption(f"Steal-chain chart unavailable: {_e}")
+
         else:
             st.info("Select 2–3 players or click bubbles on the Scatter tab.")
 
@@ -1251,6 +1427,13 @@ with st.sidebar:
     if st.button("🔄 Refresh data"):
         st.cache_data.clear()
         st.rerun()
+    # FIX 5 — debug toggle: shows norm X.X | raw X.X line on each card
+    st.session_state["debug_mode"] = st.checkbox(
+        "🔧 Debug card values",
+        value=st.session_state.get("debug_mode", False),
+        key="debug_mode_cb",
+        help="Show season norm and raw GS+ under each player card",
+    )
     st.caption("GS+ data refreshes every 30 s · Season analytics cached 24 h")
 
 # Load season data (non-blocking)
