@@ -427,9 +427,39 @@ def _last5_games(player_id: int, season_df: pd.DataFrame) -> list[dict]:
 # LIVE DATA helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
+from nba.replay import (
+    fetch_recent_games,
+    fetch_play_by_play,
+    fetch_box_roster,
+    build_replay_timeline,
+    quarter_checkpoints,
+    get_snapshots_at_frame,
+)
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _live_games() -> list[dict]:
     return get_live_games()
+
+
+# ── Replay cached fetchers ────────────────────────────────────────────────────
+
+@st.cache_data(ttl=3_600, show_spinner=False)
+def _recent_games(days_back: int = 7) -> list[dict]:
+    try:
+        return fetch_recent_games(days_back)
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=3_600, show_spinner=False)
+def _replay_timeline(game_id: str):
+    """Build full replay timeline for a completed game. Cached 1 h."""
+    try:
+        pbp    = fetch_play_by_play(game_id)
+        roster = fetch_box_roster(game_id)
+        return build_replay_timeline(pbp, roster)
+    except Exception as e:
+        return []
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -501,12 +531,10 @@ def _card_html(snap: GSPlusSnapshot) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_bio_page(player_id: int, season_df: pd.DataFrame) -> None:
-    # ── Back link ──────────────────────────────────────────────────────────
     if st.button("← Back to court", key="bio_back"):
         st.session_state["active_player_id"] = None
         st.rerun()
 
-    # ── Pull data ─────────────────────────────────────────────────────────
     with st.spinner("Loading player data…"):
         bio   = _player_bio(player_id)
         avgs  = _season_averages(player_id)
@@ -515,196 +543,119 @@ def render_bio_page(player_id: int, season_df: pd.DataFrame) -> None:
     player_name = bio.get("name", f"Player {player_id}")
     headshot    = nba_headshot_url(player_id).replace("1040x760", "260x190")
 
+    # ── Dragon / Fortress from season_df ──────────────────────────────────
+    dragon_val = fortress_val = dragon_rank = fortress_rank = None
+    if not season_df.empty and "PLAYER_ID" in season_df.columns:
+        prow = season_df[season_df["PLAYER_ID"] == player_id]
+        if not prow.empty:
+            dragon_val   = prow.iloc[0].get("DRAGON_INDEX")
+            fortress_val = prow.iloc[0].get("FORTRESS_RATING")
+            if dragon_val is not None:
+                dragon_rank   = int((season_df["DRAGON_INDEX"] > dragon_val).sum() + 1)
+            if fortress_val is not None:
+                fortress_rank = int((season_df["FORTRESS_RATING"] > fortress_val).sum() + 1)
+    norm = get_player_season_norm(player_id, season_df)
+
     # ── Identity header ───────────────────────────────────────────────────
-    col_img, col_info, col_ctx = st.columns([1, 2, 3])
-
+    col_img, col_info = st.columns([1, 4])
     with col_img:
-        st.markdown(
-            f'<img src="{headshot}" class="bio-headshot" '
-            f'onerror="this.style.display=\'none\'" />',
-            unsafe_allow_html=True,
-        )
-
+        st.image(headshot, width=100)
     with col_info:
-        st.markdown(f'<div class="bio-name">{player_name}</div>', unsafe_allow_html=True)
-        jersey   = bio.get("jersey", "")
-        position = bio.get("position", "")
-        team     = bio.get("team", "")
-        st.markdown(
-            f'<div class="bio-meta">#{jersey} · {position} · {team}</div>',
-            unsafe_allow_html=True,
-        )
-        height = bio.get("height", "")
-        weight = bio.get("weight", "")
-        age    = bio.get("age", "")
-        exp    = bio.get("exp", "")
-        st.markdown(
-            f'<div class="bio-detail">{height} · {weight} lbs · Age {age} · {exp} yr exp</div>',
-            unsafe_allow_html=True,
-        )
+        st.subheader(player_name)
+        jersey, position, team = bio.get("jersey",""), bio.get("position",""), bio.get("team","")
+        st.caption(f"#{jersey} · {position} · {team}")
+        height, weight, age, exp = bio.get("height",""), bio.get("weight",""), bio.get("age",""), bio.get("exp","")
+        st.caption(f"{height} · {weight} lbs · Age {age} · {exp} yr exp")
 
-    with col_ctx:
-        # Dragon / Fortress from season_df
-        dragon_val = fortress_val = dragon_rank = fortress_rank = None
-        if not season_df.empty and "PLAYER_ID" in season_df.columns:
-            prow = season_df[season_df["PLAYER_ID"] == player_id]
-            if not prow.empty:
-                dragon_val   = prow.iloc[0].get("DRAGON_INDEX")
-                fortress_val = prow.iloc[0].get("FORTRESS_RATING")
-                if dragon_val is not None and "DRAGON_INDEX" in season_df.columns:
-                    dragon_rank = int(
-                        (season_df["DRAGON_INDEX"] > dragon_val).sum() + 1
-                    )
-                if fortress_val is not None and "FORTRESS_RATING" in season_df.columns:
-                    fortress_rank = int(
-                        (season_df["FORTRESS_RATING"] > fortress_val).sum() + 1
-                    )
+    st.divider()
 
-        norm = get_player_season_norm(player_id, season_df)
+    # ── Context metrics row ───────────────────────────────────────────────
+    ctx_cols = st.columns(3)
+    ctx_cols[0].metric("Season GS+ Norm", f"{norm:+.1f}", help="Per-game baseline GS+")
+    if dragon_val is not None:
+        ctx_cols[1].metric("🐉 Dragon Index", f"{dragon_val:.1f}", f"#{dragon_rank} league")
+    if fortress_val is not None:
+        ctx_cols[2].metric("🏰 Fortress Rating", f"{fortress_val:.1f}", f"#{fortress_rank} league")
 
-        ctx_html = '<div class="bio-ctx-cards">'
-        ctx_html += f"""
-        <div class="bio-ctx-card">
-          <div class="bio-ctx-label">Season GS+ Norm</div>
-          <div class="bio-ctx-value" style="color:#EB6E1F">{norm:+.1f}</div>
-          <div class="bio-ctx-sub">per-game baseline</div>
-        </div>
-        """
-        if dragon_val is not None:
-            ctx_html += f"""
-            <div class="bio-ctx-card">
-              <div class="bio-ctx-label">Dragon Index</div>
-              <div class="bio-ctx-value" style="color:#e74c3c">{dragon_val:.1f}</div>
-              <div class="bio-ctx-sub">#{dragon_rank} in league</div>
-            </div>
-            """
-        if fortress_val is not None:
-            ctx_html += f"""
-            <div class="bio-ctx-card">
-              <div class="bio-ctx-label">Fortress Rating</div>
-              <div class="bio-ctx-value" style="color:#4A90D9">{fortress_val:.1f}</div>
-              <div class="bio-ctx-sub">#{fortress_rank} in league</div>
-            </div>
-            """
-        ctx_html += "</div>"
-        st.markdown(ctx_html, unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ── Season averages strip ─────────────────────────────────────────────
+    # ── Season averages ───────────────────────────────────────────────────
     if avgs:
+        st.markdown("**Season averages**")
         stat_keys = ["PPG", "APG", "RPG", "SPG", "FG%", "3P%", "FT%", "MPG"]
-        strip_html = '<div class="stat-strip">'
-        for k in stat_keys:
+        avg_cols = st.columns(len(stat_keys))
+        for col, k in zip(avg_cols, stat_keys):
             val = avgs.get(k, "—")
             suffix = "%" if "%" in k else ""
-            strip_html += f"""
-            <div class="stat-box">
-              <div class="stat-val">{val}{suffix}</div>
-              <div class="stat-lbl">{k}</div>
-            </div>
-            """
-        strip_html += "</div>"
-        st.markdown(strip_html, unsafe_allow_html=True)
-    else:
-        st.caption("Season averages unavailable.")
+            col.metric(k, f"{val}{suffix}")
 
-    # ── Dragon + Fortress qualitative cards ──────────────────────────────
+    st.divider()
+
+    # ── Dragon + Fortress qualitative labels ──────────────────────────────
     if dragon_val is not None or fortress_val is not None:
         def _dragon_label(v):
-            if v is None: return "—"
-            if v >= 75: return "elite perimeter disruptor"
-            if v >= 55: return "active perimeter disruptor"
-            if v >= 35: return "moderate perimeter disruptor"
-            return "limited perimeter presence"
+            if v >= 75: return "Elite perimeter disruptor"
+            if v >= 55: return "Active perimeter disruptor"
+            if v >= 35: return "Moderate perimeter disruptor"
+            return "Limited perimeter presence"
 
         def _fortress_label(v):
-            if v is None: return "—"
-            if v >= 75: return "elite rim protector"
-            if v >= 55: return "reliable paint anchor"
-            if v >= 35: return "moderate interior presence"
-            return "not a paint anchor"
+            if v >= 75: return "Elite rim protector"
+            if v >= 55: return "Reliable paint anchor"
+            if v >= 35: return "Moderate interior presence"
+            return "Not a paint anchor"
 
-        df_html = '<div class="df-index-row">'
+        df_cols = st.columns(2)
         if dragon_val is not None:
-            df_html += f"""
-            <div class="df-card">
-              <div class="df-card-label">🐉 Dragon Index</div>
-              <div class="df-card-value">{dragon_val:.1f}</div>
-              <div class="df-card-rank">#{dragon_rank} league-wide</div>
-              <div class="df-card-qual">{_dragon_label(dragon_val)}</div>
-            </div>
-            """
+            with df_cols[0]:
+                st.markdown("**🐉 Dragon Index**")
+                st.metric("Score", f"{dragon_val:.1f}", f"#{dragon_rank} league-wide")
+                st.caption(_dragon_label(dragon_val))
         if fortress_val is not None:
-            df_html += f"""
-            <div class="df-card">
-              <div class="df-card-label">🏰 Fortress Rating</div>
-              <div class="df-card-value" style="color:#4A90D9">{fortress_val:.1f}</div>
-              <div class="df-card-rank">#{fortress_rank} league-wide</div>
-              <div class="df-card-qual">{_fortress_label(fortress_val)}</div>
-            </div>
-            """
-        df_html += "</div>"
-        st.markdown(df_html, unsafe_allow_html=True)
+            with df_cols[1]:
+                st.markdown("**🏰 Fortress Rating**")
+                st.metric("Score", f"{fortress_val:.1f}", f"#{fortress_rank} league-wide")
+                st.caption(_fortress_label(fortress_val))
 
     # ── Last 5 games table ────────────────────────────────────────────────
-    st.markdown("#### Last 5 Games")
+    st.markdown("**Last 5 games**")
     if last5:
-        rows_html = ""
+        rows = []
         for g in last5:
             sign = "+" if g["gs_pct"] >= 0 else ""
-            rows_html += f"""
-            <tr>
-              <td>{g['date']}</td>
-              <td>{g['opp']}</td>
-              <td>{g['result']}</td>
-              <td>{g['min']}</td>
-              <td>{g['pts']}/{g['ast']}/{g['reb']}</td>
-              <td>{g['gs_raw']:+.1f}</td>
-              <td style="color:{g['color']};font-weight:600">{sign}{g['gs_pct']:.0f}%</td>
-            </tr>
-            """
-        table_html = f"""
-        <table style="width:100%;border-collapse:collapse;font-size:12px;color:#ccc">
-          <thead>
-            <tr style="color:#666;font-size:10px;text-transform:uppercase;border-bottom:1px solid #2a2a3a">
-              <th align="left">Date</th><th align="left">Opp</th>
-              <th align="left">W/L</th><th align="left">Min</th>
-              <th align="left">P/A/R</th><th align="left">GS+</th>
-              <th align="left">vs Norm</th>
-            </tr>
-          </thead>
-          <tbody>{rows_html}</tbody>
-        </table>
-        """
-        st.markdown(table_html, unsafe_allow_html=True)
+            rows.append({
+                "Date":     g["date"],
+                "Opp":      g["opp"],
+                "W/L":      g["result"],
+                "Min":      g["min"],
+                "Pts":      g["pts"],
+                "Ast":      g["ast"],
+                "Reb":      g["reb"],
+                "GS+":      f"{g['gs_raw']:+.1f}",
+                "vs Norm":  f"{sign}{g['gs_pct']:.0f}%",
+            })
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "vs Norm": st.column_config.TextColumn("vs Norm"),
+            },
+        )
     else:
         st.caption("Game log unavailable.")
 
-    # ── Tonight's GS+ timeline (if live game available) ───────────────────
+    # ── Tonight's live GS+ (if applicable) ───────────────────────────────
     live_games = _live_games()
-    player_snap = None
     for g in live_games:
-        snaps = _live_snapshots(g["game_id"], "")
-        for s in snaps:
+        for s in _live_snapshots(g["game_id"], ""):
             if s.player_id == player_id:
-                player_snap = s
+                st.divider()
+                st.markdown("**Tonight — live GS+**")
+                lc1, lc2, lc3 = st.columns(3)
+                sign = "+" if s.pct_vs_norm >= 0 else ""
+                lc1.metric("vs Norm", f"{sign}{s.pct_vs_norm:.0f}%")
+                lc2.metric("Raw GS+", f"{s.raw_gs_plus:+.1f}")
+                lc3.metric("Tier", s.tier)
                 break
-
-    if player_snap:
-        st.markdown("#### Tonight's GS+ Timeline")
-        # Build timeline from history (requires GameState — simplified sparkline)
-        sign = "+" if player_snap.pct_vs_norm >= 0 else ""
-        st.markdown(
-            f'<div class="bio-ctx-card live" style="display:inline-block;margin-bottom:12px">'
-            f'<div class="bio-ctx-label">LIVE GS+</div>'
-            f'<div class="bio-ctx-value" style="color:{player_snap.tier_color}">'
-            f'{sign}{player_snap.pct_vs_norm:.0f}%</div>'
-            f'<div class="bio-ctx-sub">{player_snap.raw_gs_plus:+.1f} raw · {player_snap.tier}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-        st.caption("Full timeline requires live play-by-play — coming in a future update.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1048,6 +999,164 @@ def _render_season_tabs(nba_df: pd.DataFrame) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GAME REPLAY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_replay(season_df: pd.DataFrame) -> None:
+    """
+    Replay viewer: pick a completed game from the last 7 days,
+    scrub through it possession-by-possession, and watch GS+ cards update.
+    """
+    st.markdown("## 🎬 Game Replay")
+    st.caption(
+        "Select any completed game from the past week. "
+        "Use the scrubber to jump to any moment and see each player's GS+ at that point."
+    )
+
+    # ── Game picker ───────────────────────────────────────────────────────
+    with st.spinner("Fetching recent games…"):
+        games = _recent_games(days_back=7)
+
+    if not games:
+        st.info("No completed games found in the last 7 days. Try refreshing.")
+        return
+
+    # Build label map
+    game_labels = {
+        g["game_id"]: f"{g['game_date']}  ·  {g['away_abbr']} @ {g['home_abbr']}  "
+                      f"{g['away_score']}–{g['home_score']}"
+        for g in games
+    }
+    sel_id = st.selectbox(
+        "Pick a game",
+        list(game_labels.keys()),
+        format_func=lambda gid: game_labels[gid],
+        key="replay_game_sel",
+    )
+    sel_game = next(g for g in games if g["game_id"] == sel_id)
+
+    st.markdown(
+        f"**{sel_game['away_abbr']}** {sel_game['away_score']} — "
+        f"{sel_game['home_score']} **{sel_game['home_abbr']}**  ·  {sel_game['game_date']}"
+    )
+
+    # ── Load timeline ─────────────────────────────────────────────────────
+    with st.spinner("Loading play-by-play (cached 1 h)…"):
+        timeline = _replay_timeline(sel_id)
+
+    if not timeline:
+        st.warning("Play-by-play unavailable for this game. Try another.")
+        return
+
+    checkpoints = quarter_checkpoints(timeline)   # [(label, frame_idx), ...]
+    cp_labels   = [c[0] for c in checkpoints]
+    cp_indices  = [c[1] for c in checkpoints]
+
+    # ── Quarter-jump buttons ──────────────────────────────────────────────
+    st.markdown("**Jump to:**")
+    btn_cols = st.columns(len(checkpoints))
+    for col, (label, idx) in zip(btn_cols, checkpoints):
+        if col.button(label, key=f"cp_{label}_{sel_id}"):
+            st.session_state["replay_frame_idx"] = idx
+
+    if "replay_frame_idx" not in st.session_state:
+        st.session_state["replay_frame_idx"] = 0
+
+    # ── Fine-grained scrubber ─────────────────────────────────────────────
+    frame_idx = st.slider(
+        "Scrub through game",
+        min_value=0,
+        max_value=len(timeline) - 1,
+        value=st.session_state["replay_frame_idx"],
+        step=1,
+        key="replay_slider",
+        help="Move left → right to advance through the game event by event",
+    )
+    st.session_state["replay_frame_idx"] = frame_idx
+
+    frame = timeline[frame_idx]
+
+    # ── Game clock display ────────────────────────────────────────────────
+    period_label = f"Q{frame.period}" if frame.period <= 4 else f"OT{frame.period - 4}"
+    cl1, cl2, cl3 = st.columns([1, 2, 1])
+    cl1.metric("Period", period_label)
+    cl2.metric(
+        "Score",
+        f"{sel_game['away_abbr']} {frame.away_score}  –  {frame.home_score} {sel_game['home_abbr']}",
+    )
+    cl3.metric("Clock", frame.clock)
+
+    # Last play description
+    if frame.description:
+        st.info(f"▶ {frame.description}")
+
+    st.divider()
+
+    # ── GS+ cards at this moment ──────────────────────────────────────────
+    home_snaps, away_snaps = get_snapshots_at_frame(frame, season_df, top_n=5)
+
+    away_label = sel_game["away_abbr"]
+    home_label = sel_game["home_abbr"]
+
+    for team_label, snaps in [(away_label, away_snaps), (home_label, home_snaps)]:
+        st.markdown(f"**{team_label}**")
+        if snaps:
+            card_html = '<div class="card-grid">'
+            for snap in snaps:
+                card_html += _card_html(snap)
+            card_html += "</div>"
+            st.markdown(card_html, unsafe_allow_html=True)
+        else:
+            st.caption("No stat activity yet at this point in the game.")
+
+    # ── GS+ sparkline — top contributor per team ──────────────────────────
+    import plotly.graph_objects as go
+
+    st.divider()
+    st.markdown("**GS+ arc — top contributors through this moment**")
+
+    # Build per-player history across all frames up to current
+    player_history: dict[int, list[float]] = {}
+    player_names_map: dict[int, str] = {}
+    sample_step = max(1, len(timeline) // 150)   # at most 150 points
+
+    for i in range(0, frame_idx + 1, sample_step):
+        f = timeline[i]
+        h_snaps, a_snaps = get_snapshots_at_frame(f, season_df, top_n=3)
+        for s in h_snaps + a_snaps:
+            player_history.setdefault(s.player_id, []).append(s.pct_vs_norm)
+            player_names_map[s.player_id] = s.player_name.split()[-1]
+
+    if player_history:
+        fig = go.Figure()
+        # Draw season-norm reference line at 0%
+        fig.add_hline(y=0, line_dash="dot", line_color="#555", annotation_text="season norm")
+        colors = ["#EB6E1F", "#4A90D9", "#2ecc71", "#e74c3c", "#9b59b6",
+                  "#f39c12", "#1abc9c", "#e67e22", "#3498db", "#95a5a6"]
+        for i, (pid, vals) in enumerate(player_history.items()):
+            fig.add_trace(go.Scatter(
+                y=vals,
+                mode="lines",
+                name=player_names_map.get(pid, str(pid)),
+                line=dict(color=colors[i % len(colors)], width=2),
+                hovertemplate="%{y:+.0f}%<extra>" + player_names_map.get(pid, "") + "</extra>",
+            ))
+        fig.update_layout(
+            paper_bgcolor="#0a0a0f",
+            plot_bgcolor="#0d0d1a",
+            font_color="#aaa",
+            margin=dict(l=0, r=0, t=10, b=0),
+            height=260,
+            yaxis_title="% vs norm",
+            xaxis_title="event (sampled)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            yaxis=dict(zeroline=False, gridcolor="#1a1a2e"),
+            xaxis=dict(gridcolor="#1a1a2e"),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ADMIN PAGE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1134,7 +1243,7 @@ with st.sidebar:
     st.markdown("---")
     nav = st.radio(
         "Navigate",
-        ["🏠 Live Court", "📊 Season", "🔧 Admin"],
+        ["🏠 Live Court", "🎬 Replay", "📊 Season", "🔧 Admin"],
         key="nav",
         label_visibility="collapsed",
     )
@@ -1157,6 +1266,9 @@ if st.session_state.get("active_player_id") is not None:
 
 elif nav == "🏠 Live Court":
     render_homepage(sdf)
+
+elif nav == "🎬 Replay":
+    render_replay(sdf)
 
 elif nav == "📊 Season":
     st.markdown("# 📊 Season Analytics")

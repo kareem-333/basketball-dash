@@ -25,8 +25,8 @@ from __future__ import annotations
 
 CORAL   = "#EB6E1F"
 OPACITY = "0.75"
-SW      = "2"        # main stroke width
-SW_THIN = "1.5"     # thin lines (restricted area, inner circle)
+SW      = "2"        # uniform stroke width — matches outer trim on all elements
+SW_THIN = "2"        # kept separate for reference but equals SW (brief v5: all lines uniform)
 
 # ── Court constants (feet / SVG units) ───────────────────────────────────────
 W, H      = 94, 50         # court width, height
