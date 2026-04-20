@@ -313,11 +313,15 @@ analytics.track_page_view(
 )
 
 # ── Session state defaults ────────────────────────────────────────────────────
+_NAV_OPTIONS = ["🏠 Live Court", "🎬 Replay", "📊 Season", "🔧 Admin"]
+
 for key, default in [
     ("active_player_id", None),
     ("selected_game_id", None),
     ("compare_ids", []),
     ("admin_auth", False),
+    ("nav", "🏠 Live Court"),   # free key — NOT bound to any widget
+    ("debug_mode", False),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -1412,17 +1416,30 @@ def render_admin() -> None:
 # TOP-LEVEL NAV + ROUTING
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Sidebar nav
+# ── Sidebar nav ───────────────────────────────────────────────────────────────
+# "nav" is a FREE session-state key (not bound to any widget) so other parts
+# of the app can write st.session_state["nav"] = "..." without triggering
+# StreamlitAPIException.  The radio uses index= to stay in sync.
 with st.sidebar:
     st.markdown("## 🏀 GS+ Live")
     st.markdown(f"*Season {SEASON}*")
     st.markdown("---")
-    nav = st.radio(
+    _nav_idx = (
+        _NAV_OPTIONS.index(st.session_state["nav"])
+        if st.session_state["nav"] in _NAV_OPTIONS
+        else 0
+    )
+    _nav_sel = st.radio(
         "Navigate",
-        ["🏠 Live Court", "🎬 Replay", "📊 Season", "🔧 Admin"],
-        key="nav",
+        _NAV_OPTIONS,
+        index=_nav_idx,
+        key="_nav_radio",          # internal widget key — never written to externally
         label_visibility="collapsed",
     )
+    # Keep the free "nav" key in sync with what the user clicked
+    st.session_state["nav"] = _nav_sel
+    nav = _nav_sel
+
     st.markdown("---")
     if st.button("🔄 Refresh data"):
         st.cache_data.clear()
