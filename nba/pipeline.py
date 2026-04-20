@@ -611,7 +611,7 @@ def get_all_player_metrics() -> pd.DataFrame:
 
 _PLAYOFF_STAT_COLS = [
     "PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "TEAM_ABBREVIATION",
-    "GP", "PTS", "FTM", "FTA", "FGM", "FGA", "OREB", "TOV", "PF",
+    "GP", "PTS", "FTM", "FTA", "FGM", "FGA", "OREB", "AST", "TOV", "PF",
 ]
 
 

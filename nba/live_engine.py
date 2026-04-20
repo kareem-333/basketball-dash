@@ -118,6 +118,10 @@ class GSPlusSnapshot:
 
     season_norm:     float = 0.0  # player's season baseline GS+
 
+    # Registered D-event contributions added to the offensive score this game
+    dragon_pts:   float = 0.0   # perimeter disruption (steals, deflections, charges…)
+    fortress_pts: float = 0.0   # interior anchoring (blocks, rim contests, boxouts…)
+
 
 @dataclass
 class GameState:
@@ -175,9 +179,20 @@ def _fortress_pts(b: BoxStats) -> float:
 
 
 def compute_gs_plus(b: BoxStats) -> float:
-    """Raw GS+ for a single BoxStats."""
-    off = _offensive_half(b)
-    def_ = 0.7 * (_dragon_pts(b) + _fortress_pts(b))
+    """
+    Raw GS+ for a single BoxStats.
+
+    Dragon and Fortress events are added to the offensive half (they create
+    scoring opportunities) AND kept in the defensive multiplier, so each
+    defensive action registers on both sides of the ledger.
+
+      GS+ = (off + dragon + fortress) + 0.7·(dragon + fortress)
+          = off + 1.7·(dragon + fortress)
+    """
+    dragon  = _dragon_pts(b)
+    fortress = _fortress_pts(b)
+    off = _offensive_half(b) + dragon + fortress
+    def_ = 0.7 * (dragon + fortress)
     return off + def_
 
 
@@ -251,7 +266,10 @@ def compute_snapshot(
     Compute a full GSPlusSnapshot from a live BoxStats + season baseline.
     Mutates game state (history, takeover counter).
     """
-    raw = compute_gs_plus(box)
+    # Compute D-event components once so they can be stored on the snapshot
+    dragon_p  = _dragon_pts(box)
+    fortress_p = _fortress_pts(box)
+    raw = _offensive_half(box) + dragon_p + fortress_p + 0.7 * (dragon_p + fortress_p)
 
     # Early-game shrinkage
     shrunk = _shrink(raw, season_norm, box.possessions_elapsed)
@@ -293,6 +311,8 @@ def compute_snapshot(
         bench_state=bench,
         foul_trouble=box.foul_trouble,
         season_norm=round(season_norm, 2),
+        dragon_pts=round(dragon_p, 2),
+        fortress_pts=round(fortress_p, 2),
     )
 
 
@@ -518,6 +538,45 @@ def compute_gs_plus_norm_from_pipeline(pipeline_df: "pd.DataFrame") -> "pd.DataF
     def_ = pd.Series(0.0, index=df.index)
     if "DRAGON_INDEX" in df.columns and "FORTRESS_RATING" in df.columns:
         # Dragon/Fortress are 0-100 indices; scale to per-game pts
+        def_ = 0.7 * (df["DRAGON_INDEX"] / 10.0 + df["FORTRESS_RATING"] / 10.0)
+
+    df["GS_PLUS_NORM"] = (off + def_).clip(lower=0)
+    return df
+
+
+def compute_gs_plus_norm_per_game(df: "pd.DataFrame") -> "pd.DataFrame":
+    """
+    Compute GS_PLUS_NORM from a DataFrame whose stat columns are already
+    per-game averages (e.g. get_playoff_regular_season_df()).
+
+    Unlike compute_gs_plus_norm_from_pipeline(), this function does NOT
+    divide by GP — the Hollinger formula is applied directly to per-game
+    averages, giving a realistic per-game GS+ baseline for each player.
+
+    If DRAGON_INDEX / FORTRESS_RATING columns are present (joined from the
+    full season metrics), the defensive component uses the same 0.7×
+    scaling calibrated in the rest of the engine.
+    """
+    df = df.copy()
+    required = {"PTS", "FGM", "FGA", "FTA", "FTM", "OREB", "PF", "TOV"}
+    if not required.issubset(df.columns):
+        df["GS_PLUS_NORM"] = LEAGUE_AVG_GS_PLUS
+        return df
+
+    ast_col = df["AST"] if "AST" in df.columns else pd.Series(0.0, index=df.index)
+    off = (
+        df["PTS"]
+        + 0.4 * df["FGM"]
+        - 0.7 * df["FGA"]
+        - 0.4 * (df["FTA"] - df["FTM"])
+        + 0.7 * df["OREB"]
+        + 0.7 * ast_col
+        - 0.4 * df["PF"]
+        - df["TOV"]
+    )
+
+    def_ = pd.Series(0.0, index=df.index)
+    if "DRAGON_INDEX" in df.columns and "FORTRESS_RATING" in df.columns:
         def_ = 0.7 * (df["DRAGON_INDEX"] / 10.0 + df["FORTRESS_RATING"] / 10.0)
 
     df["GS_PLUS_NORM"] = (off + def_).clip(lower=0)
