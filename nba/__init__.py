@@ -15,6 +15,8 @@ from nba.pipeline import (
     get_team_aggregates,
     get_player_rolling_trend,
     get_play_sequence_stats,
+    get_playoff_regular_season_df,
+    get_playoff_postseason_df,
     team_color,
     nba_logo_url,
     nba_headshot_url,
@@ -67,6 +69,7 @@ __all__ = [
     # pipeline
     "get_all_player_metrics", "get_team_aggregates",
     "get_player_rolling_trend", "get_play_sequence_stats",
+    "get_playoff_regular_season_df", "get_playoff_postseason_df",
     "team_color", "nba_logo_url", "nba_headshot_url",
     "DRAGON_WEIGHTS", "FORTRESS_WEIGHTS", "SEASON",
     # charts

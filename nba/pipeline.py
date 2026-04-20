@@ -607,6 +607,94 @@ def get_all_player_metrics() -> pd.DataFrame:
     return df
 
 
+# ── Playoff team stats DataFrames ────────────────────────────────────────────
+
+_PLAYOFF_STAT_COLS = [
+    "PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "TEAM_ABBREVIATION",
+    "GP", "PTS", "FTM", "FTA", "FGM", "FGA", "OREB", "TOV", "PF",
+]
+
+
+def _fetch_league_base(season_type: str, per_mode: str) -> pd.DataFrame:
+    """Fetch LeagueDashPlayerStats Base for any season type and per-mode."""
+    return _call(
+        LeagueDashPlayerStats,
+        season=SEASON,
+        season_type_all_star=season_type,
+        measure_type_detailed_defense="Base",
+        per_mode_detailed=per_mode,
+    )
+
+
+@st.cache_data(ttl=CACHE_TTL_S, show_spinner=False)
+def get_playoff_regular_season_df() -> pd.DataFrame:
+    """
+    Regular season per-game averages for players on playoff teams.
+
+    Playoff teams are discovered dynamically by fetching the playoff
+    roster and extracting unique TEAM_IDs — no hardcoding required.
+
+    Cached to disk (playoff_regular_season.pkl) with a 24-hour TTL.
+    Columns: PLAYER_ID, PLAYER_NAME, TEAM_ID, TEAM_ABBREVIATION,
+             GP, PTS, FTM, FTA, FGM, FGA, OREB, TOV, PF
+    """
+    if _is_cache_fresh("playoff_regular_season"):
+        try:
+            df = _load("playoff_regular_season")
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception:
+            pass
+
+    # Discover playoff teams from the postseason roster
+    playoff_raw = _fetch_league_base("Playoffs", "Totals")
+    if playoff_raw.empty:
+        return pd.DataFrame()
+    playoff_team_ids = set(playoff_raw["TEAM_ID"].unique())
+
+    # Fetch full regular season per-game averages and filter to playoff teams
+    reg_raw = _fetch_league_base("Regular Season", "PerGame")
+    if reg_raw.empty:
+        return pd.DataFrame()
+
+    df = reg_raw[reg_raw["TEAM_ID"].isin(playoff_team_ids)].copy()
+    cols = [c for c in _PLAYOFF_STAT_COLS if c in df.columns]
+    df = df[cols].reset_index(drop=True)
+
+    if not df.empty:
+        _save("playoff_regular_season", df)
+    return df
+
+
+@st.cache_data(ttl=CACHE_TTL_S, show_spinner=False)
+def get_playoff_postseason_df() -> pd.DataFrame:
+    """
+    Postseason cumulative game totals for all players who appeared in the playoffs.
+
+    Cached to disk (playoff_postseason.pkl) with a 24-hour TTL.
+    Columns: PLAYER_ID, PLAYER_NAME, TEAM_ID, TEAM_ABBREVIATION,
+             GP, PTS, FTM, FTA, FGM, FGA, OREB, TOV, PF
+    """
+    if _is_cache_fresh("playoff_postseason"):
+        try:
+            df = _load("playoff_postseason")
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception:
+            pass
+
+    raw = _fetch_league_base("Playoffs", "Totals")
+    if raw.empty:
+        return pd.DataFrame()
+
+    cols = [c for c in _PLAYOFF_STAT_COLS if c in raw.columns]
+    df = raw[cols].reset_index(drop=True)
+
+    if not df.empty:
+        _save("playoff_postseason", df)
+    return df
+
+
 # ── Team aggregate view ───────────────────────────────────────────────────────
 
 def get_team_aggregates(df: pd.DataFrame) -> pd.DataFrame:
