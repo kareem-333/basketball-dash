@@ -569,6 +569,22 @@ def _fetch_all_fresh() -> pd.DataFrame:
     df["COMBINED_SCORE"] = ((df["DRAGON_INDEX"] + df["FORTRESS_RATING"]) / 2).round(1)
 
     df = df[df["GP"] >= 10].reset_index(drop=True)
+
+    # ── League percentile ranks (FIX 8) ──────────────────────────────────
+    step("Computing league percentile ranks…")
+    _PCTILE_METRICS = [
+        "DRAGON_INDEX", "FORTRESS_RATING", "STL", "DEFLECTIONS",
+        "CHARGES_DRAWN", "BLK", "DREB", "TRK_DEF_RIM_FG_PCT",
+    ]
+    for m in _PCTILE_METRICS:
+        if m in df.columns:
+            if m == "TRK_DEF_RIM_FG_PCT":
+                # Lower allowed FG% = better defender, so invert
+                df[f"{m}_PCTILE"] = (1 - df[m].rank(pct=True)) * 100
+            else:
+                df[f"{m}_PCTILE"] = df[m].rank(pct=True) * 100
+            df[f"{m}_PCTILE"] = df[f"{m}_PCTILE"].round(1)
+
     ph.empty()
     return df
 

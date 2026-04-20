@@ -25,8 +25,8 @@ from __future__ import annotations
 
 CORAL   = "#EB6E1F"
 OPACITY = "0.75"
-SW      = "2"        # uniform stroke width — matches outer trim on all elements
-SW_THIN = "2"        # kept separate for reference but equals SW (brief v5: all lines uniform)
+SW      = "1"        # visual stroke weight (non-scaling)
+SW_THIN = "1"        # same weight — all lines uniform per brief v5
 
 # ── Court constants (feet / SVG units) ───────────────────────────────────────
 W, H      = 94, 50         # court width, height
@@ -63,24 +63,27 @@ CC_R_INNER  = 3
 
 # ── SVG helpers ───────────────────────────────────────────────────────────────
 
+_NNS = 'vector-effect="non-scaling-stroke"'  # lock visual weight regardless of container size
+
+
 def _line(x1, y1, x2, y2, **kw) -> str:
     extra = " ".join(f'{k}="{v}"' for k, v in kw.items())
-    return f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" {extra}/>'
+    return f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" {extra} {_NNS}/>'
 
 
 def _rect(x, y, w, h, **kw) -> str:
     extra = " ".join(f'{k}="{v}"' for k, v in kw.items())
-    return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" {extra}/>'
+    return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" {extra} {_NNS}/>'
 
 
 def _circle(cx, cy, r, **kw) -> str:
     extra = " ".join(f'{k}="{v}"' for k, v in kw.items())
-    return f'<circle cx="{cx}" cy="{cy}" r="{r}" {extra}/>'
+    return f'<circle cx="{cx}" cy="{cy}" r="{r}" {extra} {_NNS}/>'
 
 
 def _path(d, **kw) -> str:
     extra = " ".join(f'{k}="{v}"' for k, v in kw.items())
-    return f'<path d="{d}" {extra}/>'
+    return f'<path d="{d}" {extra} {_NNS}/>'
 
 
 def _base_style(**extra_kw) -> dict:
