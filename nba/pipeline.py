@@ -210,7 +210,8 @@ def _merge_all(
 
     df = base[[c for c in
                ["PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "TEAM_ABBREVIATION",
-                "GP", "MIN", "STL", "BLK", "DREB", "OREB", "PTS", "AST"]
+                "GP", "MIN", "STL", "BLK", "DREB", "OREB", "PTS", "AST",
+                "FGM", "FGA", "FTA", "FTM", "TOV", "PF"]
                if c in base.columns]].copy()
 
     adv_cols = ["PLAYER_ID", "USG_PCT", "DEF_RATING", "OFF_RATING", "NET_RATING"]
