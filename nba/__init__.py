@@ -40,9 +40,11 @@ from nba.live_engine import (
     TIERS,
     TIER_COLORS,
     POSITION_SLOTS,
+    LEAGUE_AVG_GS_PLUS,
     compute_gs_plus,
     compute_snapshot,
     compute_gs_plus_norm_from_pipeline,
+    compute_gs_plus_norm_per_game,
     fetch_live_box_stats,
     get_live_games,
     get_player_season_norm,
@@ -79,9 +81,9 @@ __all__ = [
     "plot_sequence_comparison",
     # live_engine
     "BoxStats", "GSPlusSnapshot", "GameState",
-    "TIERS", "TIER_COLORS", "POSITION_SLOTS",
+    "TIERS", "TIER_COLORS", "POSITION_SLOTS", "LEAGUE_AVG_GS_PLUS",
     "compute_gs_plus", "compute_snapshot",
-    "compute_gs_plus_norm_from_pipeline",
+    "compute_gs_plus_norm_from_pipeline", "compute_gs_plus_norm_per_game",
     "fetch_live_box_stats", "get_live_games",
     "get_player_season_norm", "assign_lineup_slots",
     # court_svg

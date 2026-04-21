@@ -27,6 +27,7 @@ from nba.pipeline import (
     get_team_aggregates,
     get_player_rolling_trend,
     get_play_sequence_stats,
+    get_playoff_regular_season_df,
     nba_headshot_url,
     SEASON,
 )
@@ -45,8 +46,10 @@ from nba.live_engine import (
     GSPlusSnapshot,
     TIER_COLORS,
     POSITION_SLOTS,
+    LEAGUE_AVG_GS_PLUS,
     compute_snapshot,
     compute_gs_plus_norm_from_pipeline,
+    compute_gs_plus_norm_per_game,
     fetch_live_box_stats,
     get_live_games,
     get_player_season_norm,
@@ -154,6 +157,7 @@ body, [data-testid="stAppViewContainer"] {
 .card-raw   { font-size: 8px;  color: #666; }
 .card-pct   { font-size: 20px; font-weight: 500; text-align: center; margin: 2px 0; line-height: 1.1; }
 .card-label { font-size: 7px;  color: #555; text-align: center; margin-top: 1px; }
+.card-df    { font-size: 7px;  color: #aaa; text-align: center; margin-top: 2px; letter-spacing: 0.5px; }
 
 .takeover-pill {
   position: absolute;
@@ -398,6 +402,30 @@ def _season_df() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=86_400, show_spinner=False)
+def _playoff_season_df() -> pd.DataFrame:
+    """
+    Per-game GS+ norms built from playoff-team regular season averages.
+
+    Dragon/Fortress indices are joined from the full season metrics so the
+    defensive component of the norm is as accurate as possible.  Used as
+    the primary norm source in _live_snapshots(); falls back to _season_df()
+    for players not on playoff teams.
+    """
+    try:
+        rs = get_playoff_regular_season_df()
+        if rs is None or rs.empty:
+            return pd.DataFrame()
+        # Enrich with Dragon/Fortress from the full metrics DataFrame
+        full = _season_df()
+        if not full.empty and "DRAGON_INDEX" in full.columns:
+            d_cols = [c for c in ["PLAYER_ID", "DRAGON_INDEX", "FORTRESS_RATING"] if c in full.columns]
+            rs = rs.merge(full[d_cols], on="PLAYER_ID", how="left")
+        return compute_gs_plus_norm_per_game(rs)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=86_400, show_spinner=False)
 def _player_bio(player_id: int) -> dict:
     """Fetch player info from nba_api commonplayerinfo."""
     info: dict = {}
@@ -586,19 +614,39 @@ def _enrich_hustle(b: "BoxStats", season_df: "pd.DataFrame") -> "BoxStats":
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _live_snapshots(game_id: str, season_df_hash: str) -> list[GSPlusSnapshot]:
-    """Compute GS+ snapshots for all players in a game. Cache 30 s."""
+    """
+    Compute GS+ snapshots for all players in a game. Cache 30 s.
+
+    Norm lookup priority:
+      1. Playoff regular-season per-game averages (get_playoff_regular_season_df)
+         — correct per-game baseline for playoff participants.
+      2. Full season metrics df (get_all_player_metrics) — fallback for any
+         player not found in the playoff data.
+      3. LEAGUE_AVG_GS_PLUS (10.0) — final fallback.
+    """
+    playoff_sdf = _playoff_season_df()
     sdf = _season_df()
     boxes = fetch_live_box_stats(game_id)
     if not boxes:
         return []
 
-    # Build a minimal GameState per game (not persisted across cache hits)
+    # Build a combined player_id → GS_PLUS_NORM mapping.
+    # General season df is loaded first; playoff data overrides it so that
+    # playoff players always get the more accurate per-game baseline.
+    norm_lookup: dict[int, float] = {}
+    for df in (sdf, playoff_sdf):
+        if df is None or df.empty or "GS_PLUS_NORM" not in df.columns:
+            continue
+        for pid, norm_val in zip(df["PLAYER_ID"], df["GS_PLUS_NORM"]):
+            v = float(norm_val)
+            if v > 0:
+                norm_lookup[int(pid)] = v
+
     state = GameState(game_id=game_id, home_team=0, away_team=0)
 
     snaps: list[GSPlusSnapshot] = []
     for b in boxes:
-        b = _enrich_hustle(b, sdf)
-        norm = get_player_season_norm(b.player_id, sdf)
+        norm = norm_lookup.get(b.player_id, LEAGUE_AVG_GS_PLUS)
         snap = compute_snapshot(b, norm, state)
         snaps.append(snap)
     return snaps
@@ -630,6 +678,19 @@ def _card_html(snap: GSPlusSnapshot, debug_mode: bool = False) -> str:
 
     arrow = snap.velocity_arrow
 
+    # Dragon / Fortress event indicators — shown when D events are contributing
+    d_pts = getattr(snap, "dragon_pts", 0.0)
+    f_pts = getattr(snap, "fortress_pts", 0.0)
+    df_parts = []
+    if d_pts > 0:
+        df_parts.append(f"🐉{d_pts:+.1f}")
+    if f_pts > 0:
+        df_parts.append(f"🏰{f_pts:+.1f}")
+    df_row = (
+        f'<div class="card-df">{" ".join(df_parts)}</div>'
+        if df_parts else ""
+    )
+
     # FIX 5 — optional debug row showing norm and raw GS+
     debug_row = (
         f'<div class="card-raw" style="color:#EB6E1F88;margin-top:2px;">'
@@ -652,6 +713,7 @@ def _card_html(snap: GSPlusSnapshot, debug_mode: bool = False) -> str:
     {pct_str} {arrow}
   </div>
   <div class="card-label">vs. norm</div>
+  {df_row}
   {debug_row}
 </div>
 """
