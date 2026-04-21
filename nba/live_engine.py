@@ -19,6 +19,7 @@ Tiers:
 from __future__ import annotations
 
 import logging
+import re as _re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -312,16 +313,39 @@ def _safe_float(v, default: float = 0.0) -> float:
         return default
 
 
+_ISO_DUR = _re.compile(r"^PT(?:(\d+)M)?(?:([\d.]+)S)?$")
+
 def _parse_min(min_str) -> float:
-    """'12:34' → 12.57 minutes."""
+    """
+    Parse playing time into decimal minutes.
+
+    Handles two formats returned by nba_api endpoints:
+      - ISO 8601 duration: "PT12M34.00S"  (live API)
+      - MM:SS string:      "12:34"        (stats API)
+      - Bare float string: "12.5"         (fallback)
+
+    Returns 0.0 on any parse failure rather than raising.
+    """
     if not min_str:
         return 0.0
-    try:
-        parts = str(min_str).split(":")
-        if len(parts) == 2:
+    s = str(min_str).strip()
+
+    m = _ISO_DUR.match(s)
+    if m:
+        mins = int(m.group(1) or 0)
+        secs = float(m.group(2) or 0)
+        return mins + secs / 60.0
+
+    if ":" in s:
+        try:
+            parts = s.split(":")
             return int(parts[0]) + int(parts[1]) / 60.0
-        return float(min_str)
-    except Exception:
+        except (ValueError, IndexError):
+            pass
+
+    try:
+        return float(s)
+    except ValueError:
         return 0.0
 
 
@@ -352,7 +376,13 @@ def fetch_live_box_stats(game_id: str) -> list[BoxStats]:
             stats = p.get("statistics", {})
 
             minutes = _parse_min(stats.get("minutesCalculated") or stats.get("minutes"))
-            on_court = bool(p.get("oncourt", minutes > 0))
+            _oncourt_raw = p.get("oncourt", "")
+            if _oncourt_raw in ("1", True, "true", "True", 1):
+                on_court = True
+            elif _oncourt_raw in ("0", False, "false", "False", 0):
+                on_court = False
+            else:
+                on_court = minutes > 0
 
             pf = _safe_int(stats.get("foulsPersonal"))
             # Rough foul trouble heuristic: 4+ fouls in regulation (check period separately if needed)
