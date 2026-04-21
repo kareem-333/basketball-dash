@@ -179,20 +179,9 @@ def _fortress_pts(b: BoxStats) -> float:
 
 
 def compute_gs_plus(b: BoxStats) -> float:
-    """
-    Raw GS+ for a single BoxStats.
-
-    Dragon and Fortress events are added to the offensive half (they create
-    scoring opportunities) AND kept in the defensive multiplier, so each
-    defensive action registers on both sides of the ledger.
-
-      GS+ = (off + dragon + fortress) + 0.7·(dragon + fortress)
-          = off + 1.7·(dragon + fortress)
-    """
-    dragon  = _dragon_pts(b)
-    fortress = _fortress_pts(b)
-    off = _offensive_half(b) + dragon + fortress
-    def_ = 0.7 * (dragon + fortress)
+    """Raw GS+ for a single BoxStats."""
+    off = _offensive_half(b)
+    def_ = 0.7 * (_dragon_pts(b) + _fortress_pts(b))
     return off + def_
 
 
@@ -266,10 +255,10 @@ def compute_snapshot(
     Compute a full GSPlusSnapshot from a live BoxStats + season baseline.
     Mutates game state (history, takeover counter).
     """
-    # Compute D-event components once so they can be stored on the snapshot
-    dragon_p  = _dragon_pts(box)
+    # Compute D-event components separately so they can be stored on the snapshot
+    dragon_p   = _dragon_pts(box)
     fortress_p = _fortress_pts(box)
-    raw = _offensive_half(box) + dragon_p + fortress_p + 0.7 * (dragon_p + fortress_p)
+    raw = _offensive_half(box) + 0.7 * (dragon_p + fortress_p)
 
     # Early-game shrinkage
     shrunk = _shrink(raw, season_norm, box.possessions_elapsed)
