@@ -578,6 +578,40 @@ def _replay_timeline(game_id: str):
         return []
 
 
+def _enrich_hustle(b: "BoxStats", season_df: "pd.DataFrame") -> "BoxStats":
+    """Fill zero hustle fields with season averages scaled by possession fraction.
+
+    The live boxscore endpoint doesn't include hustle stats (deflections, contested
+    shots, rim stats), so the defensive half of GS+ would be ~0 without this.
+    We use season per-game averages scaled by how much of the game has been played.
+    """
+    if season_df is None or season_df.empty or "PLAYER_ID" not in season_df.columns:
+        return b
+    row = season_df[season_df["PLAYER_ID"] == b.player_id]
+    if row.empty:
+        return b
+    r = row.iloc[0]
+    # ~96 half-court possessions per game; clamp to [0, 1]
+    scale = min(b.possessions_elapsed / 96.0, 1.0) if b.possessions_elapsed > 0 else 0.5
+
+    def _fill(live_val: int, col: str) -> int:
+        if live_val > 0:
+            return live_val
+        return int(round(float(r.get(col, 0) or 0) * scale))
+
+    from dataclasses import replace as _replace
+    return _replace(b,
+        deflections=_fill(b.deflections, "DEFLECTIONS"),
+        charges_drawn=_fill(b.charges_drawn, "CHARGES_DRAWN"),
+        contested_2pt=_fill(b.contested_2pt, "CONTESTED_SHOTS_2PT"),
+        contested_3pt=_fill(b.contested_3pt, "CONTESTED_SHOTS_3PT"),
+        loose_balls=_fill(b.loose_balls, "DEF_LOOSE_BALLS_RECOVERED"),
+        def_boxouts=_fill(b.def_boxouts, "DEF_BOXOUTS"),
+        rim_fga_defended=_fill(b.rim_fga_defended, "DEF_RIM_FGA"),
+        rim_fgm_defended=_fill(b.rim_fgm_defended, "DEF_RIM_FGM"),
+    )
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _live_snapshots(game_id: str, season_df_hash: str) -> list[GSPlusSnapshot]:
     """
@@ -1202,21 +1236,25 @@ def _render_season_tabs(nba_df: pd.DataFrame) -> None:
                 "STL", "BLK", "DREB", "MIN"] if c in comp_df.columns]
             st.dataframe(comp_df[stat_cols].round(2), use_container_width=True, hide_index=True)
 
-            # FIX 7 — Steal chain Sankey (restored)
+            # Steal-chain Sankey — one chart per selected player
             st.markdown("---")
             st.markdown("#### Steal-chain analysis")
             st.caption(
                 "Sankey shows how steal-to-transition sequences originate and terminate "
                 "for each selected player (sample from season play sequences)."
             )
-            try:
-                sankey_fig = plot_steal_chain_sankey(comp_df)
-                if sankey_fig is not None:
+            for pname in comp_sel:
+                pid_row = nba_df[nba_df["PLAYER_NAME"] == pname]
+                if pid_row.empty:
+                    continue
+                pid = int(pid_row.iloc[0]["PLAYER_ID"])
+                with st.spinner(f"Loading steal chains for {pname}…"):
+                    seq = get_play_sequence_stats(pid, n_games=10)
+                try:
+                    sankey_fig = plot_steal_chain_sankey(seq, pname)
                     st.plotly_chart(sankey_fig, use_container_width=True)
-                else:
-                    st.caption("Steal-chain data not available for selected players.")
-            except Exception as _e:
-                st.caption(f"Steal-chain chart unavailable: {_e}")
+                except Exception as _e:
+                    st.caption(f"{pname} — steal-chain data unavailable: {_e}")
 
         else:
             st.info("Select 2–3 players or click bubbles on the Scatter tab.")
