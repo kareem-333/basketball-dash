@@ -14,7 +14,9 @@ Typical usage
 
 from __future__ import annotations
 
+import copy
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -101,14 +103,21 @@ def fetch_recent_games(days_back: int = 7) -> list[dict]:
     date_to   = datetime.date.today().strftime("%m/%d/%Y")
 
     try:
-        time.sleep(0.6)
-        lg = LeagueGameLog(
-            season=SEASON,
-            date_from_nullable=date_from,
-            date_to_nullable=date_to,
-            direction="DESC",
-        )
-        df = lg.game_log.get_data_frame()
+        # Try Playoffs first (active during April–June), then Regular Season.
+        # LeagueGameLog defaults to "Regular Season" which returns nothing during playoffs.
+        df = pd.DataFrame()
+        for season_type in ("Playoffs", "Regular Season"):
+            time.sleep(0.6)
+            lg = LeagueGameLog(
+                season=SEASON,
+                season_type_all_star=season_type,
+                date_from_nullable=date_from,
+                date_to_nullable=date_to,
+                direction="DESC",
+            )
+            df = lg.get_data_frames()[0]
+            if not df.empty:
+                break
         if df.empty:
             return []
 
@@ -142,37 +151,60 @@ def fetch_recent_games(days_back: int = 7) -> list[dict]:
 
 def fetch_play_by_play(game_id: str) -> pd.DataFrame:
     """
-    Return play-by-play DataFrame for a completed game.
-    Columns of interest: EVENTNUM, PERIOD, PCTIMESTRING, EVENTMSGTYPE,
-    EVENTMSGACTIONTYPE, PLAYER1_ID, PLAYER1_NAME, PLAYER1_TEAM_ID,
-    PLAYER2_ID, PLAYER2_NAME, PLAYER3_ID, PLAYER3_NAME,
-    HOMEDESCRIPTION, VISITORDESCRIPTION, SCORE
+    Return play-by-play DataFrame for a completed game using PlayByPlayV3.
+
+    V3 columns used downstream: actionNumber, period, clock, actionType,
+    subType, personId, teamId, playerName, description, scoreHome,
+    scoreAway, shotValue.
     """
-    from nba_api.stats.endpoints import PlayByPlayV2
+    from nba_api.stats.endpoints import PlayByPlayV3
     time.sleep(0.6)
-    pbp = PlayByPlayV2(game_id=game_id)
-    df = pbp.play_by_play.get_data_frame()
-    return df
+    pbp = PlayByPlayV3(game_id=game_id)
+    return pbp.get_data_frames()[0]
 
 
 def fetch_box_roster(game_id: str) -> pd.DataFrame:
     """
-    Return the final box score player list so we know team_id + position
-    for each player even before they've scored.
+    Return the final box score player list (BoxScoreTraditionalV3),
+    normalised to the V2 column names expected by build_replay_timeline:
+    PLAYER_ID, TEAM_ID, PLAYER_NAME, START_POSITION.
     """
-    from nba_api.stats.endpoints import BoxScoreTraditionalV2
+    from nba_api.stats.endpoints import BoxScoreTraditionalV3
     time.sleep(0.6)
-    box = BoxScoreTraditionalV2(game_id=game_id)
-    return box.player_stats.get_data_frame()
+    box = BoxScoreTraditionalV3(game_id=game_id)
+    df = box.get_data_frames()[0]
+    if df.empty:
+        return df
+    # Normalise V3 → V2 column names
+    df = df.rename(columns={
+        "personId":   "PLAYER_ID",
+        "teamId":     "TEAM_ID",
+        "position":   "START_POSITION",
+    })
+    if "firstName" in df.columns and "familyName" in df.columns:
+        df["PLAYER_NAME"] = (
+            df["firstName"].fillna("").str.strip()
+            + " "
+            + df["familyName"].fillna("").str.strip()
+        ).str.strip()
+    return df
 
 
 # ── Timeline builder ──────────────────────────────────────────────────────────
 
+_ISO_CLOCK = re.compile(r"^PT(\d+)M([\d.]+)S$")
+
+
 def _clock_to_seconds(clock_str: str, period: int) -> float:
-    """Convert 'MM:SS' remaining + period to elapsed seconds."""
+    """Convert 'MM:SS' or 'PT12M34.00S' remaining + period to elapsed seconds."""
     try:
-        parts = str(clock_str).split(":")
-        rem = int(parts[0]) * 60 + int(parts[1])
+        s = str(clock_str).strip()
+        m = _ISO_CLOCK.match(s)
+        if m:
+            rem = int(m.group(1)) * 60 + int(float(m.group(2)))
+        else:
+            parts = s.split(":")
+            rem = int(parts[0]) * 60 + int(parts[1])
         period_secs = 12 * 60 if period <= 4 else 5 * 60
         elapsed_per_period = (period - 1) * 12 * 60 if period <= 4 else 48 * 60 + (period - 5) * 5 * 60
         return elapsed_per_period + (period_secs - rem)
@@ -180,11 +212,154 @@ def _clock_to_seconds(clock_str: str, period: int) -> float:
         return 0.0
 
 
+def _v3_clock_display(clock: str) -> str:
+    """Convert 'PT12M34.00S' → '12:34'.  Pass-through for already-display clocks."""
+    m = _ISO_CLOCK.match(str(clock).strip())
+    if m:
+        return f"{int(m.group(1)):02d}:{int(float(m.group(2))):02d}"
+    return clock
+
+
 def _safe_int(v) -> int:
     try:
         return int(v) if v and str(v) not in ("", "nan", "None") else 0
     except (ValueError, TypeError):
         return 0
+
+
+def _build_v3_timeline(
+    events_df: pd.DataFrame,
+    roster_df: pd.DataFrame,
+    accum: dict,
+    home_team_id: int,
+    away_team_id: int,
+) -> list[ReplayFrame]:
+    """V3 play-by-play event handler (PlayByPlayV3 column names)."""
+
+    # Build last-name → player_id and player_id → team_id lookups from roster
+    name_to_pid: dict[str, int] = {}
+    pid_to_team: dict[int, int] = {}
+    if not roster_df.empty:
+        for _, row in roster_df.iterrows():
+            pid = _safe_int(row.get("PLAYER_ID"))
+            tid = _safe_int(row.get("TEAM_ID"))
+            name = str(row.get("PLAYER_NAME", "") or "")
+            if pid:
+                pid_to_team[pid] = tid
+                last = name.split()[-1] if name else ""
+                if last:
+                    name_to_pid[last] = pid
+
+    home_score = 0
+    away_score = 0
+    frames: list[ReplayFrame] = []
+
+    _AST_RE = re.compile(r"\((\S+)\s+\d+\s+AST\)")
+
+    for _, row in events_df.iterrows():
+        action     = str(row.get("actionType", "") or "")
+        sub        = str(row.get("subType", "") or "")
+        person_id  = _safe_int(row.get("personId"))
+        team_id    = _safe_int(row.get("teamId"))
+        period     = _safe_int(row.get("period") or 1) or 1
+        clock      = _v3_clock_display(str(row.get("clock", "12:00") or "12:00"))
+        desc       = str(row.get("description", "") or "")
+        shot_value = _safe_int(row.get("shotValue"))
+
+        # Score columns are direct strings in V3
+        sh = str(row.get("scoreHome", "") or "")
+        sa = str(row.get("scoreAway", "") or "")
+        if sh.isdigit() and sa.isdigit():
+            home_score = int(sh)
+            away_score = int(sa)
+
+        # Seed new primary player from event
+        if person_id and person_id not in accum:
+            accum[person_id] = PlayerAccum(
+                player_id=person_id,
+                player_name=str(row.get("playerName", "") or ""),
+                team_id=team_id,
+            )
+
+        def acc(pid: int) -> Optional[PlayerAccum]:
+            return accum.get(pid) if pid else None
+
+        if action == "Made Shot":
+            p = acc(person_id)
+            if p:
+                p.fgm += 1
+                p.fga += 1
+                p.pts += shot_value if shot_value > 0 else 2
+            # Parse assist from description: "(LastName N AST)"
+            m = _AST_RE.search(desc)
+            if m:
+                last = m.group(1)
+                ast_pid = name_to_pid.get(last)
+                if ast_pid:
+                    if ast_pid not in accum:
+                        accum[ast_pid] = PlayerAccum(
+                            player_id=ast_pid,
+                            player_name=last,
+                            team_id=pid_to_team.get(ast_pid, 0),
+                        )
+                    a = acc(ast_pid)
+                    if a:
+                        a.ast += 1
+
+        elif action == "Missed Shot":
+            p = acc(person_id)
+            if p:
+                p.fga += 1
+
+        elif action == "Free Throw":
+            p = acc(person_id)
+            if p:
+                p.fta += 1
+                if not desc.startswith("MISS"):
+                    p.ftm += 1
+                    p.pts += 1
+
+        elif action == "Rebound":
+            p = acc(person_id)
+            if p:
+                # subType: "Off:1 Def:0" → offensive; "Off:0 Def:1" → defensive
+                off_m = re.search(r"Off:(\d+)", sub)
+                if off_m and int(off_m.group(1)) > 0:
+                    p.oreb += 1
+                else:
+                    p.dreb += 1
+
+        elif action == "Turnover":
+            p = acc(person_id)
+            if p:
+                p.tov += 1
+
+        elif action == "Foul":
+            p = acc(person_id)
+            if p:
+                p.pf += 1
+
+        # Estimate minutes
+        elapsed = _clock_to_seconds(clock, period)
+        for pa in accum.values():
+            if pa.fgm + pa.fga + pa.ast + pa.stl + pa.blk + pa.tov + pa.dreb + pa.oreb > 0:
+                pa.minutes_est = elapsed / 60.0 * 0.2
+
+        # Snapshot
+        player_snap = {pid: copy.copy(pa) for pid, pa in accum.items()}
+        frames.append(ReplayFrame(
+            event_idx=_safe_int(row.get("actionNumber", len(frames))),
+            period=period,
+            clock=clock,
+            description=desc[:80],
+            home_team_id=home_team_id,
+            away_team_id=away_team_id,
+            home_score=home_score,
+            away_score=away_score,
+            player_stats=player_snap,
+        ))
+
+    return frames
 
 
 def build_replay_timeline(
@@ -195,8 +370,8 @@ def build_replay_timeline(
     Build a list of ReplayFrame objects, one per play-by-play event,
     each containing cumulative stats up to that moment.
 
-    We sample one frame per event but callers can stride over this list
-    to show quarter checkpoints or every N possessions.
+    Handles both PlayByPlayV3 (actionType column) and V2 (EVENTMSGTYPE)
+    formats so tests using synthetic V2 data continue to work.
     """
     if events_df.empty:
         return []
@@ -219,13 +394,24 @@ def build_replay_timeline(
                 position=str(row.get("START_POSITION", "") or ""),
             )
 
-    # Determine home/away team IDs from roster (HOME column or first two team IDs)
+    # Determine home/away team IDs from roster
     if not roster_df.empty and "TEAM_ID" in roster_df.columns:
         team_ids = roster_df["TEAM_ID"].dropna().unique().tolist()
         if len(team_ids) >= 2:
             home_team_id = int(team_ids[0])
             away_team_id = int(team_ids[1])
 
+    # Dispatch to V3 handler when PlayByPlayV3 columns are present
+    if "actionType" in events_df.columns:
+        # Fallback team IDs from V3 teamId column
+        if home_team_id == 0:
+            tids = events_df["teamId"].dropna().unique()
+            tids = [int(t) for t in tids if t and str(t) not in ("0", "")]
+            if len(tids) >= 2:
+                home_team_id, away_team_id = tids[0], tids[1]
+        return _build_v3_timeline(events_df, roster_df, accum, home_team_id, away_team_id)
+
+    # ── V2 path (legacy / test fixtures) ──────────────────────────────────────
     # Fallback: use PLAYER1_TEAM_ID from events
     if home_team_id == 0 and not events_df.empty:
         tids = events_df["PLAYER1_TEAM_ID"].dropna().unique()
@@ -335,10 +521,7 @@ def build_replay_timeline(
                 pa.minutes_est = elapsed / 60.0 * 0.2  # heuristic only
 
         # Snapshot of accum (deep copy of stats)
-        player_snap: dict[int, PlayerAccum] = {}
-        import copy
-        for pid, pa in accum.items():
-            player_snap[pid] = copy.copy(pa)
+        player_snap: dict[int, PlayerAccum] = {pid: copy.copy(pa) for pid, pa in accum.items()}
 
         frames.append(ReplayFrame(
             event_idx=_safe_int(row.get("EVENTNUM", len(frames))),
