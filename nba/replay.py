@@ -21,6 +21,8 @@ from typing import Optional
 
 import pandas as pd
 
+from nba.pipeline import SEASON
+
 log = logging.getLogger(__name__)
 
 # ── NBA play-by-play event type constants ─────────────────────────────────────
@@ -101,7 +103,7 @@ def fetch_recent_games(days_back: int = 7) -> list[dict]:
     try:
         time.sleep(0.6)
         lg = LeagueGameLog(
-            season="2024-25",
+            season=SEASON,
             date_from_nullable=date_from,
             date_to_nullable=date_to,
             direction="DESC",
@@ -376,20 +378,25 @@ def get_snapshots_at_frame(
     frame: ReplayFrame,
     season_df: "pd.DataFrame | None",
     top_n: int = 5,
+    state: "GameState | None" = None,
 ) -> tuple[list, list]:
     """
     Convert a ReplayFrame into two lists of GSPlusSnapshot (home, away),
     each containing the top-N players by GS+ at that moment.
+
+    Pass a shared `state` across sequential frame calls so velocity history
+    accumulates correctly (otherwise each call starts fresh with no history).
     """
     from nba.live_engine import (
         BoxStats, GameState, compute_snapshot, get_player_season_norm
     )
 
-    state = GameState(
-        game_id="replay",
-        home_team=frame.home_team_id,
-        away_team=frame.away_team_id,
-    )
+    if state is None:
+        state = GameState(
+            game_id="replay",
+            home_team=frame.home_team_id,
+            away_team=frame.away_team_id,
+        )
 
     home_snaps, away_snaps = [], []
 

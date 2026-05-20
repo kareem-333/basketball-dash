@@ -10,6 +10,7 @@ All user-facing metric columns use SCREAMING_SNAKE_CASE (DRAGON_INDEX, FORTRESS_
 Internal normalised component columns use lowercase (d_rim_n, f_blocks_n…).
 """
 
+import datetime as _dt
 import time
 import pickle
 import logging
@@ -32,7 +33,22 @@ log = logging.getLogger(__name__)
 # Cache lives next to the package root (one level up from nba/)
 CACHE_DIR   = Path(__file__).parent.parent / "cache" / "nba"
 CACHE_TTL_S = 86_400          # 24 hours
-SEASON      = "2024-25"
+
+
+def _current_nba_season() -> str:
+    """Return the active NBA season string, e.g. '2025-26'.
+
+    Sep+ → new season is starting (current year is first half).
+    Jan–Aug → current/ending season (current year is second half).
+    """
+    today = _dt.date.today()
+    y = today.year
+    if today.month >= 9:
+        return f"{y}-{str(y + 1)[2:]}"
+    return f"{y - 1}-{str(y)[2:]}"
+
+
+SEASON: str = _current_nba_season()
 RATE_DELAY  = 0.75            # seconds between nba_api calls
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
