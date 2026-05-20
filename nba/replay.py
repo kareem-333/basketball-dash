@@ -101,14 +101,21 @@ def fetch_recent_games(days_back: int = 7) -> list[dict]:
     date_to   = datetime.date.today().strftime("%m/%d/%Y")
 
     try:
-        time.sleep(0.6)
-        lg = LeagueGameLog(
-            season=SEASON,
-            date_from_nullable=date_from,
-            date_to_nullable=date_to,
-            direction="DESC",
-        )
-        df = lg.game_log.get_data_frame()
+        # Try Playoffs first (active during April–June), then Regular Season.
+        # LeagueGameLog defaults to "Regular Season" which returns nothing during playoffs.
+        df = pd.DataFrame()
+        for season_type in ("Playoffs", "Regular Season"):
+            time.sleep(0.6)
+            lg = LeagueGameLog(
+                season=SEASON,
+                season_type_all_star=season_type,
+                date_from_nullable=date_from,
+                date_to_nullable=date_to,
+                direction="DESC",
+            )
+            df = lg.game_log.get_data_frame()
+            if not df.empty:
+                break
         if df.empty:
             return []
 
