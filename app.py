@@ -575,6 +575,7 @@ def _replay_timeline(game_id: str):
         roster = fetch_box_roster(game_id)
         return build_replay_timeline(pbp, roster)
     except Exception as e:
+        log.warning("_replay_timeline failed for %s: %s", game_id, e)
         return []
 
 
@@ -1288,6 +1289,10 @@ def render_replay(season_df: pd.DataFrame) -> None:
     Replay viewer: pick a completed game from the last 7 days,
     scrub through it possession-by-possession, and watch GS+ cards update.
     """
+    # Prefer playoff regular-season per-game norms (same priority as live snapshots)
+    playoff_sdf = _playoff_season_df()
+    norm_df = playoff_sdf if not playoff_sdf.empty else season_df
+
     st.markdown("## 🎬 Game Replay")
     st.caption(
         "Select any completed game from the past week. "
@@ -1374,7 +1379,7 @@ def render_replay(season_df: pd.DataFrame) -> None:
     st.divider()
 
     # ── GS+ cards at this moment ──────────────────────────────────────────
-    home_snaps, away_snaps = get_snapshots_at_frame(frame, season_df, top_n=5)
+    home_snaps, away_snaps = get_snapshots_at_frame(frame, norm_df, top_n=5)
 
     away_label = sel_game["away_abbr"]
     home_label = sel_game["home_abbr"]
@@ -1396,14 +1401,21 @@ def render_replay(season_df: pd.DataFrame) -> None:
     st.divider()
     st.markdown("**GS+ arc — top contributors through this moment**")
 
-    # Build per-player history across all frames up to current
+    # Build per-player history across all frames up to current.
+    # A single shared GameState is passed sequentially so velocity history
+    # accumulates correctly (arrows reflect actual in-game momentum shifts).
     player_history: dict[int, list[float]] = {}
     player_names_map: dict[int, str] = {}
     sample_step = max(1, len(timeline) // 150)   # at most 150 points
 
+    arc_state = GameState(
+        game_id="replay",
+        home_team=timeline[0].home_team_id,
+        away_team=timeline[0].away_team_id,
+    )
     for i in range(0, frame_idx + 1, sample_step):
         f = timeline[i]
-        h_snaps, a_snaps = get_snapshots_at_frame(f, season_df, top_n=3)
+        h_snaps, a_snaps = get_snapshots_at_frame(f, norm_df, top_n=3, state=arc_state)
         for s in h_snaps + a_snaps:
             player_history.setdefault(s.player_id, []).append(s.pct_vs_norm)
             player_names_map[s.player_id] = s.player_name.split()[-1]
