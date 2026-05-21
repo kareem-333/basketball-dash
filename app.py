@@ -1364,13 +1364,19 @@ def render_replay(season_df: pd.DataFrame) -> None:
 
     # ── Game clock display ────────────────────────────────────────────────
     period_label = f"Q{frame.period}" if frame.period <= 4 else f"OT{frame.period - 4}"
-    cl1, cl2, cl3 = st.columns([1, 2, 1])
-    cl1.metric("Period", period_label)
-    cl2.metric(
-        "Score",
-        f"{sel_game['away_abbr']} {frame.away_score}  –  {frame.home_score} {sel_game['home_abbr']}",
+    st.markdown(
+        f"<p style='text-align:center;font-size:1.3em;font-weight:700;"
+        f"margin:4px 0 4px;color:#eee;letter-spacing:.03em'>"
+        f"{period_label} &nbsp;·&nbsp; {frame.clock} remaining</p>",
+        unsafe_allow_html=True,
     )
-    cl3.metric("Clock", frame.clock)
+    st.markdown(
+        f"<p style='text-align:center;font-size:1em;color:#aaa;margin:0 0 8px'>"
+        f"{sel_game['away_abbr']} <b>{frame.away_score}</b>"
+        f" &nbsp;–&nbsp; "
+        f"<b>{frame.home_score}</b> {sel_game['home_abbr']}</p>",
+        unsafe_allow_html=True,
+    )
 
     # Last play description
     if frame.description:
@@ -1384,16 +1390,16 @@ def render_replay(season_df: pd.DataFrame) -> None:
     away_label = sel_game["away_abbr"]
     home_label = sel_game["home_abbr"]
 
-    for team_label, snaps in [(away_label, away_snaps), (home_label, home_snaps)]:
-        st.markdown(f"**{team_label}**")
-        if snaps:
-            card_html = '<div class="card-grid">'
-            for snap in snaps:
-                card_html += _card_html(snap)
-            card_html += "</div>"
-            st.markdown(card_html, unsafe_allow_html=True)
-        else:
-            st.caption("No stat activity yet at this point in the game.")
+    if home_snaps or away_snaps:
+        _render_court_with_cards(
+            home_top5=home_snaps,
+            away_top5=away_snaps,
+            home_abbr=home_label,
+            away_abbr=away_label,
+            debug_mode=st.session_state.get("debug_mode", False),
+        )
+    else:
+        st.caption("No stat activity yet at this point in the game.")
 
     # ── GS+ sparkline — top contributor per team ──────────────────────────
     import plotly.graph_objects as go
@@ -1418,7 +1424,9 @@ def render_replay(season_df: pd.DataFrame) -> None:
         h_snaps, a_snaps = get_snapshots_at_frame(f, norm_df, top_n=3, state=arc_state)
         for s in h_snaps + a_snaps:
             player_history.setdefault(s.player_id, []).append(s.pct_vs_norm)
-            player_names_map[s.player_id] = s.player_name.split()[-1]
+            player_names_map[s.player_id] = (
+                s.player_name.split()[-1] if s.player_name.strip() else str(s.player_id)
+            )
 
     if player_history:
         fig = go.Figure()
