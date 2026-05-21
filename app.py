@@ -517,7 +517,7 @@ def _last5_games(player_id: int, season_df: pd.DataFrame) -> list[dict]:
             tier, color = _classify_tier(pct)
             games.append({
                 "date":   str(r.get("GAME_DATE", "")),
-                "opp":    str(r.get("MATCHUP", "")).split()[-1],
+                "opp":    (lambda m: m.split()[-1] if m.split() else "")(str(r.get("MATCHUP", ""))),
                 "result": str(r.get("WL", "")),
                 "min":    str(r.get("MIN", "")),
                 "pts":    int(r.get("PTS", 0)),
@@ -707,7 +707,7 @@ def _card_html(snap: GSPlusSnapshot, debug_mode: bool = False) -> str:
      title="Click for {snap.player_name} bio">
   {takeover_pill}{foul_icon}{bench_icon}
   <div class="card-top">
-    <span class="card-name">{snap.player_name.split()[-1]}</span>
+    <span class="card-name">{snap.player_name.split()[-1] if snap.player_name.strip() else str(snap.player_id)}</span>
     <span class="card-raw">{raw_str}</span>
   </div>
   <div class="card-pct" style="color:{snap.tier_color}">
@@ -1096,11 +1096,11 @@ def _render_season_tabs(nba_df: pd.DataFrame) -> None:
             top_combined = filt_df.nlargest(1, "COMBINED_SCORE").iloc[0]
             b1, b2, b3, b4 = st.columns(4)
             b1.metric("Players loaded", len(filt_df))
-            b2.metric("🐉 Dragon #1",   top_dragon.get("PLAYER_NAME", "").split()[-1],
+            b2.metric("🐉 Dragon #1",   (lambda n: n.split()[-1] if n.split() else "—")(top_dragon.get("PLAYER_NAME", "")),
                       f"{top_dragon['DRAGON_INDEX']:.1f}")
-            b3.metric("🏰 Fortress #1", top_fortress.get("PLAYER_NAME", "").split()[-1],
+            b3.metric("🏰 Fortress #1", (lambda n: n.split()[-1] if n.split() else "—")(top_fortress.get("PLAYER_NAME", "")),
                       f"{top_fortress['FORTRESS_RATING']:.1f}")
-            b4.metric("⭐ Best Combined", top_combined.get("PLAYER_NAME", "").split()[-1],
+            b4.metric("⭐ Best Combined", (lambda n: n.split()[-1] if n.split() else "—")(top_combined.get("PLAYER_NAME", "")),
                       f"{top_combined['COMBINED_SCORE']:.1f}")
 
     st.markdown("---")
